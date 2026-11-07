@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: cmux-agent-restore
+
+builds:
+  - main: .
+    binary: cmux-agent-restore
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+# Name the repository explicitly so that goreleaser does not need a git remote.
+release:
+  github:
+    owner: wada811
+    name: cmux-agent-restore
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+# Homebrew: `brews` is deprecated in favor of `homebrew_casks` (since v2.10).
+homebrew_casks:
+  - name: cmux-agent-restore
+    homepage: https://github.com/wada811/cmux-agent-restore
+    description: Re-send `cmux restore` to Claude Code and Codex tabs that cmux failed to bring back
+    license: MIT
+    repository:
+      owner: wada811
+      name: homebrew-tap
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    directory: Casks
+    # The binary is not signed or notarized; drop the quarantine attribute.
+    # Homebrew deprecated `postflight` (what `hooks` generates) for `postflight_steps`.
+    custom_block: |
+      postflight_steps do
+        run "/usr/bin/xattr",
+            args:           ["-dr", "com.apple.quarantine", "{{ "{{" }}staged_path{{ "}}" }}/cmux-agent-restore"],
+            writable_paths: ["cmux-agent-restore"]
+      end
