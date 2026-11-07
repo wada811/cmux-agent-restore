@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,9 +36,29 @@ func execRunner(name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	// 起動元が持つ Node のフラグ（--require など）を cmux の CLI に引き継がない
 	cmd.Env = append(os.Environ(), "NODE_OPTIONS=")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	if err != nil {
+		err = &cmdError{err: err, stderr: strings.TrimSpace(stderr.String())}
+	}
 	return string(out), err
 }
+
+// cmdError is a failed command with what it wrote to stderr, so callers and logs can say why.
+type cmdError struct {
+	err    error
+	stderr string
+}
+
+func (e *cmdError) Error() string {
+	if e.stderr == "" {
+		return e.err.Error()
+	}
+	return e.err.Error() + ": " + e.stderr
+}
+
+func (e *cmdError) Unwrap() error { return e.err }
 
 // Tab は cmux tree の terminal タブ。
 type Tab struct {

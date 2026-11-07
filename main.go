@@ -266,7 +266,7 @@ func cmdInstall(args []string, stdout, stderr io.Writer, d deps) int {
 		return 1
 	}
 	exe = stableExePath(exe, d.lookPath)
-	if err := installAgent(d.run, d.paths, exe, setRunArgs(fs), f.interval, d.uid, d.user, stdout); err != nil {
+	if err := installAgent(d.run, d.sleep, d.paths, exe, setRunArgs(fs), f.interval, d.uid, d.user, stdout); err != nil {
 		fmt.Fprintln(stderr, "cmux-agent-restore:", err)
 		return 1
 	}

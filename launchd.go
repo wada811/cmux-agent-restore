@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -72,37 +73,117 @@ func plistXML(exe string, runArgs []string, interval time.Duration, home, user s
 
 func domainTarget(uid int) string { return fmt.Sprintf("gui/%d", uid) }
 
-// installAgent は plist を実ファイル（symlink でなく）で書き、launchctl bootstrap で読み込む。
-// すでに読み込まれていれば、いったん外してから読み込み直す。
-func installAgent(run Runner, p paths, exe string, runArgs []string, interval time.Duration, uid int, user string, stdout io.Writer) error {
+const (
+	// bootoutWaitTries · bootoutWaitInterval: launchctl bootout returns before the service is gone,
+	// and a bootstrap right after it fails with "Bootstrap failed: 5: Input/output error".
+	bootoutWaitTries    = 25
+	bootoutWaitInterval = 200 * time.Millisecond
+	bootstrapTries      = 5
+	bootstrapInterval   = time.Second
+)
+
+// writeFileAtomic writes data to a temporary file next to path and renames it over path, so a
+// reader never sees a half-written plist. If path is a symlink, the symlink itself is replaced
+// (launchd does not load a symlinked plist automatically).
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// isNotRegistered reports whether a failed launchctl bootout means "the service was not loaded".
+func isNotRegistered(out string, err error) bool {
+	text := out
+	if err != nil {
+		text += " " + err.Error()
+	}
+	return strings.Contains(text, "No such process") || strings.Contains(text, "Could not find service")
+}
+
+// installAgent writes the plist as a regular file (atomically) and loads it with launchctl bootstrap.
+// If it is already loaded, it is booted out first. If loading fails, the previous plist is put back
+// and loaded again, so a failed install does not leave the machine without the job.
+func installAgent(run Runner, sleep func(time.Duration), p paths, exe string, runArgs []string, interval time.Duration, uid int, user string, stdout io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(p.plistFile), 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(p.logFile), 0o755); err != nil {
 		return err
 	}
-	// symlink だと launchd が自動で読み込まないので、あれば消して実ファイルで置く
-	os.Remove(p.plistFile)
-	if err := os.WriteFile(p.plistFile, []byte(plistXML(exe, runArgs, interval, p.home, user)), 0o644); err != nil {
+	target := domainTarget(uid) + "/" + launchdLabel
+	oldPlist, readErr := os.ReadFile(p.plistFile)
+	hadOld := readErr == nil
+
+	rollback := func(cause error) error {
+		var restoreErr error
+		if hadOld {
+			restoreErr = writeFileAtomic(p.plistFile, oldPlist, 0o644)
+			if restoreErr == nil {
+				if out, err := run("launchctl", "bootstrap", domainTarget(uid), p.plistFile); err != nil {
+					restoreErr = fmt.Errorf("could not load the previous plist again: %v %s", err, strings.TrimSpace(out))
+				}
+			}
+		} else {
+			os.Remove(p.plistFile)
+		}
+		if restoreErr != nil {
+			return fmt.Errorf("%w (and the rollback failed: %v)", cause, restoreErr)
+		}
+		return fmt.Errorf("%w (the previous plist was put back)", cause)
+	}
+
+	if err := writeFileAtomic(p.plistFile, []byte(plistXML(exe, runArgs, interval, p.home, user)), 0o644); err != nil {
 		return err
 	}
-	run("launchctl", "bootout", domainTarget(uid)+"/"+launchdLabel) // 未登録なら失敗するので無視する
-	if out, err := run("launchctl", "bootstrap", domainTarget(uid), p.plistFile); err != nil {
-		return fmt.Errorf("launchctl bootstrap に失敗: %v %s", err, strings.TrimSpace(out))
+	if out, err := run("launchctl", "bootout", target); err != nil && !isNotRegistered(out, err) {
+		return rollback(fmt.Errorf("launchctl bootout failed: %v %s", err, strings.TrimSpace(out)))
 	}
-	fmt.Fprintf(stdout, "インストールした: %s（%s ごとに実行）\n", p.plistFile, interval)
-	return nil
+	// Wait until launchd has really dropped the job
+	gone := false
+	for i := 0; i < bootoutWaitTries; i++ {
+		if _, err := run("launchctl", "print", target); err != nil {
+			gone = true
+			break
+		}
+		sleep(bootoutWaitInterval)
+	}
+	if !gone {
+		return rollback(errors.New("the job is still registered after launchctl bootout"))
+	}
+	var lastErr error
+	for i := 0; i < bootstrapTries; i++ {
+		if i > 0 {
+			sleep(bootstrapInterval)
+		}
+		out, err := run("launchctl", "bootstrap", domainTarget(uid), p.plistFile)
+		if err == nil {
+			fmt.Fprintf(stdout, "Installed %s (runs every %s)\n", p.plistFile, interval)
+			return nil
+		}
+		lastErr = fmt.Errorf("launchctl bootstrap failed: %v %s", err, strings.TrimSpace(out))
+	}
+	return rollback(lastErr)
 }
 
-// uninstallAgent は launchd から外し、plist を消す。
+// uninstallAgent boots the job out of launchd and removes the plist. If bootout fails for any reason
+// other than "not registered", the plist is kept: removing it would leave a loaded job with no file.
 func uninstallAgent(run Runner, p paths, uid int, stdout io.Writer) error {
 	if out, err := run("launchctl", "bootout", domainTarget(uid)+"/"+launchdLabel); err != nil {
-		fmt.Fprintf(stdout, "launchd に登録されていなかった（%s）\n", strings.TrimSpace(out))
+		if !isNotRegistered(out, err) {
+			return fmt.Errorf("launchctl bootout failed, plist kept: %v %s", err, strings.TrimSpace(out))
+		}
+		fmt.Fprintln(stdout, "The job was not registered with launchd")
 	}
 	if err := os.Remove(p.plistFile); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	fmt.Fprintf(stdout, "アンインストールした: %s\n", p.plistFile)
+	fmt.Fprintf(stdout, "Uninstalled %s\n", p.plistFile)
 	return nil
 }
 

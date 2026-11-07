@@ -127,24 +127,66 @@ func TestPlistXML(t *testing.T) {
 	}
 }
 
-func TestInstallAndUninstall(t *testing.T) {
-	home := t.TempDir()
-	p := defaultPaths(home)
-	var calls []string
-	run := func(name string, args ...string) (string, error) {
-		calls = append(calls, name+" "+strings.Join(args, " "))
+// fakeLaunchctl is launchctl with the timing that matters: bootout returns before the job is gone
+// (print keeps succeeding for printAfterBootout more calls), and bootstrap can fail.
+type fakeLaunchctl struct {
+	loaded            bool
+	printAfterBootout int // how many print calls still succeed after bootout
+	bootstrapFails    int // how many bootstrap calls fail before one succeeds (-1: always)
+	pending           int
+	bootoutErr        error
+	bootoutOut        string
+	calls             []string
+	bootstrapped      []string // plist content at each successful bootstrap
+}
+
+func (f *fakeLaunchctl) run(name string, args ...string) (string, error) {
+	f.calls = append(f.calls, args[0])
+	switch args[0] {
+	case "bootout":
+		if f.bootoutErr != nil {
+			return f.bootoutOut, f.bootoutErr
+		}
+		if !f.loaded {
+			return "Boot-out failed: 3: No such process", errors.New("exit 3")
+		}
+		f.loaded = false
+		f.pending = f.printAfterBootout
+		return "", nil
+	case "print":
+		if f.loaded || f.pending > 0 {
+			if f.pending > 0 {
+				f.pending--
+			}
+			return "state = running", nil
+		}
+		return "", errors.New("exit 113")
+	case "bootstrap":
+		if f.bootstrapFails != 0 {
+			if f.bootstrapFails > 0 {
+				f.bootstrapFails--
+			}
+			return "", errors.New("Bootstrap failed: 5: Input/output error")
+		}
+		b, _ := os.ReadFile(args[2])
+		f.bootstrapped = append(f.bootstrapped, string(b))
+		f.loaded = true
 		return "", nil
 	}
+	return "", nil
+}
+
+func noSleep(time.Duration) {}
+
+func TestInstallFresh(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	f := &fakeLaunchctl{}
 	var out bytes.Buffer
-	if err := installAgent(run, p, "/bin/car", []string{"--kinds", "claude"}, 10*time.Minute, 501, "andy", &out); err != nil {
+	if err := installAgent(f.run, noSleep, p, "/bin/car", []string{"--kinds", "claude"}, 10*time.Minute, 501, "andy", &out); err != nil {
 		t.Fatal(err)
 	}
-	wantCalls := []string{
-		"launchctl bootout gui/501/com.wada811.cmux-agent-restore",
-		"launchctl bootstrap gui/501 " + p.plistFile,
-	}
-	if !reflect.DeepEqual(calls, wantCalls) {
-		t.Errorf("launchctl %v, want %v", calls, wantCalls)
+	if want := []string{"bootout", "print", "bootstrap"}; !reflect.DeepEqual(f.calls, want) {
+		t.Errorf("launchctl %v, want %v", f.calls, want)
 	}
 	fi, err := os.Lstat(p.plistFile)
 	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
@@ -154,34 +196,135 @@ func TestInstallAndUninstall(t *testing.T) {
 	if !strings.Contains(string(b), "<integer>600</integer>") || !strings.Contains(string(b), "<string>claude</string>") {
 		t.Errorf("plist %s", b)
 	}
+	if _, err := os.Stat(p.plistFile + ".tmp"); !os.IsNotExist(err) {
+		t.Error("一時ファイルが残っている")
+	}
+}
 
-	calls = nil
-	if err := uninstallAgent(run, p, 501, &out); err != nil {
+func TestWriteFileAtomicReplacesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.plist")
+	link := filepath.Join(dir, "link.plist")
+	_ = os.WriteFile(real, []byte("old"), 0o644)
+	_ = os.Symlink(real, link)
+	if err := writeFileAtomic(link, []byte("new"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(calls, []string{"launchctl bootout gui/501/com.wada811.cmux-agent-restore"}) {
-		t.Errorf("launchctl %v", calls)
+	fi, _ := os.Lstat(link)
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("symlink のまま")
+	}
+	if b, _ := os.ReadFile(real); string(b) != "old" {
+		t.Errorf("symlink の先を書き換えた: %q", b)
+	}
+}
+
+func TestInstallWaitsForBootoutToFinish(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	f := &fakeLaunchctl{loaded: true, printAfterBootout: 3}
+	var slept int
+	sleep := func(time.Duration) { slept++ }
+	if err := installAgent(f.run, sleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err != nil {
+		t.Fatalf("bootout が遅れても成功するはず: %v", err)
+	}
+	if slept < 3 {
+		t.Errorf("print が失敗するまで待っていない（待ち %d 回）", slept)
+	}
+	if !f.loaded {
+		t.Error("読み込まれていない")
+	}
+}
+
+func TestInstallRetriesBootstrap(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	f := &fakeLaunchctl{bootstrapFails: 2}
+	if err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err != nil {
+		t.Fatalf("2 回失敗しても 3 回目で通るはず: %v", err)
+	}
+	n := 0
+	for _, c := range f.calls {
+		if c == "bootstrap" {
+			n++
+		}
+	}
+	if n != 3 {
+		t.Errorf("bootstrap %d 回, want 3", n)
+	}
+}
+
+func TestInstallRestoresPreviousPlistWhenBootstrapFails(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	_ = os.MkdirAll(filepath.Dir(p.plistFile), 0o755)
+	_ = os.WriteFile(p.plistFile, []byte("OLD PLIST"), 0o644)
+	f := &fakeLaunchctl{loaded: true, bootstrapFails: bootstrapTries} // 新しい plist の bootstrap だけ失敗し、元のは通る
+	err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("bootstrap の失敗が error にならなかった")
+	}
+	if b, _ := os.ReadFile(p.plistFile); string(b) != "OLD PLIST" {
+		t.Errorf("元の plist が戻っていない: %q", b)
+	}
+	if !f.loaded || len(f.bootstrapped) != 1 || f.bootstrapped[0] != "OLD PLIST" {
+		t.Errorf("元の plist を読み込み直していない: loaded=%v bootstrapped=%q", f.loaded, f.bootstrapped)
+	}
+	if !strings.Contains(err.Error(), "previous plist was put back") {
+		t.Errorf("error %v", err)
+	}
+}
+
+func TestInstallRemovesNewPlistWhenThereWasNoPreviousAndBootstrapFails(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	f := &fakeLaunchctl{bootstrapFails: -1}
+	if err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err == nil {
+		t.Fatal("error にならなかった")
+	}
+	if _, err := os.Stat(p.plistFile); !os.IsNotExist(err) {
+		t.Error("失敗した plist が残っている")
+	}
+}
+
+func TestInstallFailsWhenJobStaysRegistered(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	f := &fakeLaunchctl{loaded: true, printAfterBootout: 1000}
+	if err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err == nil {
+		t.Error("外れないのに成功した")
+	}
+}
+
+func TestUninstall(t *testing.T) {
+	p := defaultPaths(t.TempDir())
+	_ = os.MkdirAll(filepath.Dir(p.plistFile), 0o755)
+	_ = os.WriteFile(p.plistFile, []byte("x"), 0o644)
+	f := &fakeLaunchctl{loaded: true}
+	if err := uninstallAgent(f.run, p, 501, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(p.plistFile); !os.IsNotExist(err) {
 		t.Error("plist が残っている")
 	}
-	// 未登録・plist なしでも失敗しない
-	failing := func(string, ...string) (string, error) { return "not loaded", errors.New("exit 3") }
-	if err := uninstallAgent(failing, p, 501, &out); err != nil {
+	// Not registered (and no plist) is fine
+	if err := uninstallAgent((&fakeLaunchctl{}).run, p, 501, &bytes.Buffer{}); err != nil {
 		t.Errorf("未登録の uninstall が失敗した: %v", err)
 	}
 }
 
-func TestInstallFailsWhenBootstrapFails(t *testing.T) {
+func TestUninstallKeepsPlistWhenBootoutFails(t *testing.T) {
 	p := defaultPaths(t.TempDir())
-	run := func(name string, args ...string) (string, error) {
-		if args[0] == "bootstrap" {
-			return "Bootstrap failed: 5", errors.New("exit 5")
-		}
-		return "", nil
+	_ = os.MkdirAll(filepath.Dir(p.plistFile), 0o755)
+	_ = os.WriteFile(p.plistFile, []byte("x"), 0o644)
+	f := &fakeLaunchctl{bootoutErr: errors.New("exit 5: Input/output error"), bootoutOut: "Boot-out failed: 5"}
+	if err := uninstallAgent(f.run, p, 501, &bytes.Buffer{}); err == nil {
+		t.Error("bootout の失敗が error にならなかった")
 	}
-	if err := installAgent(run, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err == nil {
-		t.Error("bootstrap の失敗が error にならなかった")
+	if _, err := os.Stat(p.plistFile); err != nil {
+		t.Error("読み込まれたままなのに plist を消した")
+	}
+}
+
+func TestExecRunnerErrorCarriesStderr(t *testing.T) {
+	_, err := execRunner("sh", "-c", "echo boom >&2; exit 3")
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("stderr が error に含まれない: %v", err)
 	}
 }
 
@@ -309,11 +452,7 @@ func TestExecuteRunWritesLog(t *testing.T) {
 
 func TestInstallPassesOnlyExplicitFlags(t *testing.T) {
 	d := testDeps(t)
-	var calls []string
-	d.run = func(name string, args ...string) (string, error) {
-		calls = append(calls, name+" "+strings.Join(args, " "))
-		return "", nil
-	}
+	d.run = (&fakeLaunchctl{}).run
 	d.paths = defaultPaths(t.TempDir())
 	var o, e bytes.Buffer
 	if code := execute([]string{"install", "--interval", "10m", "--kinds", "claude"}, &o, &e, d); code != 0 {
