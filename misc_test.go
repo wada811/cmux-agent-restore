@@ -79,10 +79,10 @@ func TestStateRoundTrip(t *testing.T) {
 	if s := loadState(p); len(s.Attempts) != 0 {
 		t.Errorf("無いファイルは空の状態: %v", s)
 	}
-	if err := saveState(p, State{Attempts: map[string]int{"U": 2}, LastRun: "x"}); err != nil {
+	if err := saveState(p, State{Attempts: map[string]int{"U": 2}, LastCompletedRun: "x"}); err != nil {
 		t.Fatal(err)
 	}
-	if s := loadState(p); s.Attempts["U"] != 2 || s.LastRun != "x" {
+	if s := loadState(p); s.Attempts["U"] != 2 || s.LastCompletedRun != "x" {
 		t.Errorf("読み戻せない: %v", s)
 	}
 	if err := os.WriteFile(p, []byte("{broken"), 0o644); err != nil {
@@ -330,20 +330,20 @@ func TestExecRunnerErrorCarriesStderr(t *testing.T) {
 
 func TestPrintStatus(t *testing.T) {
 	p := defaultPaths(t.TempDir())
-	_ = saveState(p.stateFile, State{Attempts: map[string]int{"U-A": 3, "U-B": 1}, LastRun: "2026-11-07T17:00:00Z"})
+	_ = saveState(p.stateFile, State{Attempts: map[string]int{"U-A": 3, "U-B": 1}, UnknownStreak: map[string]int{"U-C": 3, "U-D": 1}, LastCompletedRun: "2026-11-07T17:00:00Z"})
 	run := func(name string, args ...string) (string, error) {
 		return "gui/501/com.wada811.cmux-agent-restore = {\n\tstate = not running\n\truns = 4\n\tlast exit code = 0\n\trun interval = 300 seconds\n}", nil
 	}
 	var out bytes.Buffer
 	printStatus(run, p, 501, 3, &out)
-	for _, want := range []string{"state=not running", "実行回数=4", "最後の実行: 2026-11-07T17:00:00Z", "U-A 3/3（打ち切り", "U-B 1/3\n"} {
+	for _, want := range []string{"state=not running", "runs=4", "Last run that finished: 2026-11-07T17:00:00Z", "U-A 3/3 (gave up", "U-B 1/3\n", "U-C 3 (shown in the sidebar", "U-D 1\n"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("status に %q が無い:\n%s", want, out.String())
 		}
 	}
 	out.Reset()
 	printStatus(func(string, ...string) (string, error) { return "", errors.New("x") }, defaultPaths(t.TempDir()), 501, 3, &out)
-	if !strings.Contains(out.String(), "launchd: 未登録") || !strings.Contains(out.String(), "state.json: なし") {
+	if !strings.Contains(out.String(), "launchd: not registered") || !strings.Contains(out.String(), "state.json: none") {
 		t.Errorf("未登録・状態なし:\n%s", out.String())
 	}
 }

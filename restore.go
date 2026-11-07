@@ -278,7 +278,7 @@ func Restore(env *Env, opt Options) error {
 			env.warn("clear-status "+ws, err)
 		}
 	}
-	state.LastRun = env.Now().Format(time.RFC3339)
+	state.LastCompletedRun = env.Now().Format(time.RFC3339)
 	save()
 	return nil
 }

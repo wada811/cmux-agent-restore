@@ -294,8 +294,8 @@ func TestRestoreBatches(t *testing.T) {
 	if state.Attempts[tabs[0].uuid] != 1 || state.Attempts[tabs[6].uuid] != 1 {
 		t.Errorf("試行回数が記録されていない: %v", state.Attempts)
 	}
-	if state.LastRun != "2026-11-07T17:00:00Z" {
-		t.Errorf("last_run = %q", state.LastRun)
+	if state.LastCompletedRun != "2026-11-07T17:00:00Z" {
+		t.Errorf("last_completed_run = %q", state.LastCompletedRun)
 	}
 }
 
@@ -406,7 +406,7 @@ func TestRestoreDryRun(t *testing.T) {
 	if len(w.events) != 0 {
 		t.Errorf("dry-run で cmux に書いた: %v", w.events)
 	}
-	if after := loadState(h.env.StatePath); after.LastRun != before.LastRun || after.Attempts[a.uuid] != 3 || len(after.Attempts) != 1 {
+	if after := loadState(h.env.StatePath); after.LastCompletedRun != before.LastCompletedRun || after.Attempts[a.uuid] != 3 || len(after.Attempts) != 1 {
 		t.Errorf("dry-run で状態が変わった: %v", after)
 	}
 	if !h.logged("surface:2 エージェントがいない・前面はシェル（dry-run のため送らない）") {

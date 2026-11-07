@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -200,50 +199,68 @@ func parseLaunchctlPrint(out string) map[string]string {
 	return fields
 }
 
-// printStatus は launchd の状態・最後の実行・state.json の中身を出す。
+// printStatus prints the launchd state, the last completed run, and what state.json holds.
 func printStatus(run Runner, p paths, uid int, maxAttempts int, stdout io.Writer) {
 	if _, err := os.Stat(p.plistFile); err != nil {
-		fmt.Fprintf(stdout, "plist: なし（%s）\n", p.plistFile)
+		fmt.Fprintf(stdout, "plist: none (%s)\n", p.plistFile)
 	} else {
 		fmt.Fprintf(stdout, "plist: %s\n", p.plistFile)
 	}
 	if out, err := run("launchctl", "print", domainTarget(uid)+"/"+launchdLabel); err != nil {
-		fmt.Fprintln(stdout, "launchd: 未登録")
+		fmt.Fprintln(stdout, "launchd: not registered")
 	} else {
 		f := parseLaunchctlPrint(out)
-		fmt.Fprintf(stdout, "launchd: 登録済み（state=%s・実行回数=%s・直近の終了コード=%s・間隔=%s）\n",
+		fmt.Fprintf(stdout, "launchd: registered (state=%s, runs=%s, last exit code=%s, interval=%s)\n",
 			orDash(f["state"]), orDash(f["runs"]), orDash(f["last exit code"]), orDash(f["run interval"]))
 	}
 
 	state := loadState(p.stateFile)
 	if _, err := os.Stat(p.stateFile); err != nil {
-		fmt.Fprintf(stdout, "state.json: なし（%s）\n", p.stateFile)
+		fmt.Fprintf(stdout, "state.json: none (%s)\n", p.stateFile)
 		return
 	}
-	last := "なし"
-	if state.LastRun != "" {
-		last = state.LastRun
+	// A run that stopped early (cmux not responding, ps failing, killed by a timeout) does not update this
+	last := "never"
+	if state.LastCompletedRun != "" {
+		last = state.LastCompletedRun
 	}
-	fmt.Fprintf(stdout, "最後の実行: %s\n", last)
+	fmt.Fprintf(stdout, "Last run that finished: %s\n", last)
 	fmt.Fprintf(stdout, "state.json: %s\n", p.stateFile)
-	if len(state.Attempts) == 0 {
-		fmt.Fprintln(stdout, "試行中・打ち切りのタブ: なし")
+	if len(state.Attempts) == 0 && len(state.UnknownStreak) == 0 {
+		fmt.Fprintln(stdout, "Tabs being retried, given up on, or unverifiable: none")
 		return
 	}
-	uuids := make([]string, 0, len(state.Attempts))
-	for u := range state.Attempts {
-		uuids = append(uuids, u)
-	}
-	sort.Strings(uuids)
-	fmt.Fprintln(stdout, "タブごとの送信回数:")
-	for _, u := range uuids {
-		n := state.Attempts[u]
-		mark := ""
-		if n >= maxAttempts {
-			mark = "（打ち切り。手で戻すタブ）"
+	if len(state.Attempts) > 0 {
+		fmt.Fprintln(stdout, "Restore commands sent per tab:")
+		for _, u := range sortedKeys(state.Attempts) {
+			n := state.Attempts[u]
+			mark := ""
+			if n >= maxAttempts {
+				mark = " (gave up: restore by hand)"
+			}
+			fmt.Fprintf(stdout, "  %s %d/%d%s\n", u, n, maxAttempts, mark)
 		}
-		fmt.Fprintf(stdout, "  %s %s/%s%s\n", u, strconv.Itoa(n), strconv.Itoa(maxAttempts), mark)
 	}
+	if len(state.UnknownStreak) > 0 {
+		fmt.Fprintln(stdout, "Runs in a row a tab could not be verified as safe to type into:")
+		for _, u := range sortedKeys(state.UnknownStreak) {
+			n := state.UnknownStreak[u]
+			mark := ""
+			if n >= unknownLimit {
+				mark = " (shown in the sidebar: check by hand)"
+			}
+			fmt.Fprintf(stdout, "  %s %d%s\n", u, n, mark)
+		}
+	}
+}
+
+func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func orDash(s string) string {

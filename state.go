@@ -43,8 +43,9 @@ type State struct {
 	// UnknownStreak is surface UUID -> how many runs in a row we could not confirm that the tab is
 	// safe to type into (unknown foreground, stale or shared tty). Dropped as soon as it is confirmed.
 	UnknownStreak map[string]int `json:"unknown_streak,omitempty"`
-	// LastRun は最後に（dry-run でなく）実行した日時（RFC 3339）。
-	LastRun string `json:"last_run,omitempty"`
+	// LastCompletedRun is when the last non-dry-run run finished all the way through (RFC 3339).
+	// A run that stopped early does not update it.
+	LastCompletedRun string `json:"last_completed_run,omitempty"`
 }
 
 // loadState は state.json を読む。無い・壊れている場合は空の状態。
