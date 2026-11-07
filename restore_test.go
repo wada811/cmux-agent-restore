@@ -11,34 +11,34 @@ import (
 	"time"
 )
 
-// world は cmux と ps の差し替え。タブの一覧・記録・動いているエージェント・tty の状態を持ち、
-// 呼び出しを events に順に残す。
+// world replaces cmux and ps. It holds the tab list, records, running agents and tty state,
+// and records calls in order in events.
 type world struct {
 	mu sync.Mutex
 
 	tabs      []wTab
 	treeErr   error
 	psErr     error
-	kindsRead []string // 復元記録を読んだタブの ref
+	kindsRead []string // refs of tabs whose restore record was read
 
-	agents     map[string]bool   // 動いているエージェントがいる surface UUID
-	agentCmd   map[string]string // surface UUID → エージェントのコマンド行（空なら claude）
-	pidSurface map[string]string // 直近の ps -axo で割り当てた pid → surface UUID
-	ttyEnv     map[string]string // tty → ps eww -t の出力
-	ttyPs      map[string]string // tty → ps -t の出力
-	psCalls    int               // ps -axo の呼び出し回数
+	agents     map[string]bool   // surface UUIDs where an agent is running
+	agentCmd   map[string]string // surface UUID -> agent command line (claude if empty)
+	pidSurface map[string]string // pid -> surface UUID assigned in the latest ps -axo
+	ttyEnv     map[string]string // tty -> output of ps eww -t
+	ttyPs      map[string]string // tty -> output of ps -t
+	psCalls    int               // number of ps -axo calls
 	onPsCall   func(w *world, n int)
-	treeCalls  int                   // cmux tree の呼び出し回数
-	onTreeCall func(w *world, n int) // tree を返す直前に呼ぶ（n は 1 から）
-	sendError  map[string]error      // ref → send の失敗
-	recordOut  map[string]string     // surface UUID → resume show の出力の差し替え
-	recordErr  map[string]error      // surface UUID → resume show の失敗
+	treeCalls  int                   // number of cmux tree calls
+	onTreeCall func(w *world, n int) // called right before returning the tree (n starts at 1)
+	sendError  map[string]error      // ref -> send failure
+	recordOut  map[string]string     // surface UUID -> replacement output of resume show
+	recordErr  map[string]error      // surface UUID -> resume show failure
 
 	events []string
 }
 
 type wTab struct {
-	uuid, ref, ws, tty, kind string // kind が空なら記録なし
+	uuid, ref, ws, tty, kind string // no record if kind is empty
 	browser                  bool
 }
 
@@ -84,7 +84,7 @@ func (w *world) treeJSON() string {
 	return fmt.Sprintf(`{"windows":[{"workspaces":[%s]}]}`, strings.Join(wss, ","))
 }
 
-// refOf は --surface に渡された UUID を ref にする。UUID でなければ「BAD:」を付けて、試験が失敗するようにする。
+// refOf turns the UUID passed to --surface into a ref. If it is not a UUID, it adds "BAD:" so the test fails.
 func (w *world) refOf(target string) string {
 	for _, t := range w.tabs {
 		if t.uuid == target {
@@ -117,7 +117,7 @@ func (w *world) cmux(args []string) (string, error) {
 		}
 		return w.treeJSON(), nil
 	case "surface":
-		// --surface には UUID を渡す。ref だと cmux の再起動で別のタブを指すことがある
+		// Pass a UUID to --surface. A ref can point at another tab after cmux restarts
 		id := args[len(args)-1]
 		if err := w.recordErr[id]; err != nil {
 			return "", err
@@ -161,7 +161,7 @@ func (w *world) ps(args []string) (string, error) {
 		if w.onPsCall != nil {
 			w.onPsCall(w, w.psCalls)
 		}
-		// エージェントがいる surface ごとに pid を割り当てる。pid → surface は ps eww -p が引く
+		// Assign a pid to each surface with an agent. ps eww -p looks up pid -> surface
 		w.pidSurface = map[string]string{}
 		var lines []string
 		pid := 1000
@@ -178,7 +178,7 @@ func (w *world) ps(args []string) (string, error) {
 		}
 		return strings.Join(lines, "\n"), nil
 	case args[0] == "eww" && args[1] == "-p":
-		// 渡された pid の行だけを返す（本物の ps と同じ）
+		// Return only the lines of the pids passed (like the real ps)
 		var lines []string
 		for _, pid := range strings.Split(args[2], ",") {
 			if u, ok := w.pidSurface[pid]; ok {
@@ -195,7 +195,7 @@ func (w *world) ps(args []string) (string, error) {
 		}
 		return out, nil
 	}
-	return "", fmt.Errorf("想定外の ps: %v", args)
+	return "", fmt.Errorf("unexpected ps: %v", args)
 }
 
 func (w *world) sends() []string {
@@ -222,7 +222,7 @@ func newHarness(t *testing.T, w *world) *harness {
 		Cmux: "/fake/cmux",
 		Sleep: func(d time.Duration) {
 			h.sleeps = append(h.sleeps, d)
-			// 組の間隔だけを events に残して、送信との前後を確かめられるようにする
+			// Record only the batch pauses in events, so their order against the sends can be checked
 			if d == defaultBatchInterval || d == 5*time.Second {
 				w.record(fmt.Sprintf("sleep %s", d))
 			}
@@ -266,9 +266,9 @@ func TestRestoreBatches(t *testing.T) {
 	mustRestore(t, h, defaultOptions())
 
 	if got := len(w.sends()); got != 7 {
-		t.Fatalf("送信 %d 件, want 7", got)
+		t.Fatalf("%d sends, want 7", got)
 	}
-	// 3 件・3 件・1 件の組。組の間（3 件目と 4 件目、6 件目と 7 件目）に 20 秒あける
+	// Batches of 3, 3 and 1. Pause 20 seconds between batches (between the 3rd and 4th, and the 6th and 7th)
 	var kinds []string
 	for _, e := range w.events {
 		switch {
@@ -279,20 +279,20 @@ func TestRestoreBatches(t *testing.T) {
 		}
 	}
 	if got, want := strings.Join(kinds, ""), "sssGsssGs"; got != want {
-		t.Errorf("送信と間隔の並び %q, want %q", got, want)
+		t.Errorf("order of sends and pauses %q, want %q", got, want)
 	}
 	if got := h.count(20 * time.Second); got != 2 {
-		t.Errorf("20 秒の間隔 %d 回, want 2", got)
+		t.Errorf("%d pauses of 20 seconds, want 2", got)
 	}
 	if !slices.Contains(w.events, "send-key surface:1 enter") {
-		t.Errorf("enter を送っていない: %v", w.events)
+		t.Errorf("enter was not sent: %v", w.events)
 	}
 	if !slices.Contains(w.events, "send surface:1 cmux restore --surface "+tabs[0].uuid) {
-		t.Errorf("復元コマンドが違う: %v", w.events)
+		t.Errorf("wrong restore command: %v", w.events)
 	}
 	state := loadState(h.env.StatePath)
 	if state.Attempts[tabs[0].uuid] != 1 || state.Attempts[tabs[6].uuid] != 1 {
-		t.Errorf("試行回数が記録されていない: %v", state.Attempts)
+		t.Errorf("attempt counts were not recorded: %v", state.Attempts)
 	}
 	if state.LastCompletedRun != "2026-11-07T17:00:00Z" {
 		t.Errorf("last_completed_run = %q", state.LastCompletedRun)
@@ -311,7 +311,7 @@ func TestRestoreBatchOptions(t *testing.T) {
 	opt.BatchInterval = 5 * time.Second
 	mustRestore(t, h, opt)
 	if got := h.count(5 * time.Second); got != 2 {
-		t.Errorf("5 秒の間隔 %d 回, want 2（2・2・1 件の組）", got)
+		t.Errorf("%d pauses of 5 seconds, want 2 (batches of 2, 2, 1)", got)
 	}
 }
 
@@ -322,15 +322,15 @@ func TestRestoreNoWaitWhenBatchSentNothing(t *testing.T) {
 	}
 	w := newWorld(tabs...)
 	for _, t := range tabs {
-		w.ttyPs[t.tty] = "1 Ss -/bin/zsh\n2 S+ vim\n" // 全タブでエディタが前面
+		w.ttyPs[t.tty] = "1 Ss -/bin/zsh\n2 S+ vim\n" // an editor is in front on every tab
 	}
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if len(w.sends()) != 0 {
-		t.Errorf("送った: %v", w.sends())
+		t.Errorf("sent: %v", w.sends())
 	}
 	if got := h.count(20 * time.Second); got != 0 {
-		t.Errorf("何も送っていないのに 20 秒待った（%d 回）", got)
+		t.Errorf("waited 20 seconds although nothing was sent (%d times)", got)
 	}
 }
 
@@ -344,20 +344,20 @@ func TestRestoreStopsAtMaxAttempts(t *testing.T) {
 	mustRestore(t, h, defaultOptions())
 
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2", "surface:3"}) {
-		t.Errorf("送信先 %v, want surface:2 surface:3（3 回送ったタブには送らない）", got)
+		t.Errorf("sent to %v, want surface:2 surface:3 (no send to the tab already sent 3 times)", got)
 	}
 	state := loadState(h.env.StatePath)
 	if state.Attempts[a.uuid] != 3 || state.Attempts[b.uuid] != 2 || state.Attempts[c.uuid] != 1 {
-		t.Errorf("試行回数 %v", state.Attempts)
+		t.Errorf("attempts %v", state.Attempts)
 	}
 	if !slices.Contains(w.events, "set-status Needs restore 1 workspace:1") {
-		t.Errorf("サイドバーに出していない: %v", w.events)
+		t.Errorf("not shown in the sidebar: %v", w.events)
 	}
 	if !slices.Contains(w.events, "clear-status workspace:2") {
-		t.Errorf("打ち切りのない workspace の表示を消していない: %v", w.events)
+		t.Errorf("did not clear the display of a workspace with nothing given up: %v", w.events)
 	}
-	if !h.logged("対象 3 件（送信 2・戻らない 1）") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("targets 3 (to send 2, given up 1)") {
+		t.Errorf("log %v", h.logs)
 	}
 }
 
@@ -370,23 +370,23 @@ func TestRestoreMaxAttemptsOption(t *testing.T) {
 	opt.MaxAttempts = 1
 	mustRestore(t, h, opt)
 	if len(w.sends()) != 0 {
-		t.Errorf("1 回で打ち切る設定なのに送った: %v", w.sends())
+		t.Errorf("sent although the limit is 1: %v", w.sends())
 	}
 }
 
 func TestRestoreCleansState(t *testing.T) {
 	a, gone, back := tabN(1, "workspace:1"), tabN(2, "workspace:1"), tabN(3, "workspace:1")
 	w := newWorld(a, back)
-	w.agents[back.uuid] = true // 戻ったタブ
+	w.agents[back.uuid] = true // a tab that came back
 	h := newHarness(t, w)
 	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{a.uuid: 1, gone.uuid: 2, back.uuid: 2}})
 	mustRestore(t, h, defaultOptions())
 	state := loadState(h.env.StatePath)
 	if _, ok := state.Attempts[gone.uuid]; ok {
-		t.Error("消えたタブが状態に残っている")
+		t.Error("a tab that disappeared is still in the state")
 	}
 	if _, ok := state.Attempts[back.uuid]; ok {
-		t.Error("戻ったタブが状態に残っている")
+		t.Error("a tab that came back is still in the state")
 	}
 	if state.Attempts[a.uuid] != 2 {
 		t.Errorf("a = %d, want 2", state.Attempts[a.uuid])
@@ -404,16 +404,16 @@ func TestRestoreDryRun(t *testing.T) {
 	mustRestore(t, h, opt)
 
 	if len(w.events) != 0 {
-		t.Errorf("dry-run で cmux に書いた: %v", w.events)
+		t.Errorf("dry-run wrote to cmux: %v", w.events)
 	}
 	if after := loadState(h.env.StatePath); after.LastCompletedRun != before.LastCompletedRun || after.Attempts[a.uuid] != 3 || len(after.Attempts) != 1 {
-		t.Errorf("dry-run で状態が変わった: %v", after)
+		t.Errorf("dry-run changed the state: %v", after)
 	}
-	if !h.logged("surface:2 エージェントがいない・前面はシェル（dry-run のため送らない）") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("recheck surface:2 no agent, shell in the foreground (dry-run, not sending)") {
+		t.Errorf("log %v", h.logs)
 	}
 	if got := h.count(20 * time.Second); got != 0 {
-		t.Errorf("dry-run で 20 秒待った")
+		t.Errorf("dry-run waited 20 seconds")
 	}
 }
 
@@ -424,14 +424,14 @@ func TestRestoreDryRunDoesNotCreateStateFile(t *testing.T) {
 	opt.DryRun = true
 	mustRestore(t, h, opt)
 	if m, _ := filepath.Glob(h.env.StatePath); len(m) != 0 {
-		t.Errorf("dry-run が状態ファイルを作った")
+		t.Errorf("dry-run created a state file")
 	}
 }
 
 func TestRestoreSkipsWhenAgentStartedBeforeSend(t *testing.T) {
 	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
 	w := newWorld(a, b)
-	// 1 回目の ps（一覧作り）では見えず、送る直前の確認（2 回目）で a に起動済み
+	// The first ps (building the list) does not see it; the check right before sending (second) sees an agent already on a
 	w.onPsCall = func(w *world, n int) {
 		if n == 2 {
 			w.agents[a.uuid] = true
@@ -442,21 +442,21 @@ func TestRestoreSkipsWhenAgentStartedBeforeSend(t *testing.T) {
 	mustRestore(t, h, defaultOptions())
 
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
-		t.Errorf("送信先 %v, want surface:2 だけ", got)
+		t.Errorf("sent to %v, want surface:2 only", got)
 	}
 	state := loadState(h.env.StatePath)
 	if _, ok := state.Attempts[a.uuid]; ok {
-		t.Errorf("起動済みのタブの試行回数が残っている: %v", state.Attempts)
+		t.Errorf("the attempt count of a tab whose agent started remains: %v", state.Attempts)
 	}
-	if !h.logged("スキップ surface:1 エージェントが起動済み") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("skip surface:1 agent already running") {
+		t.Errorf("log %v", h.logs)
 	}
 }
 
 func TestRestoreSkipsWhenPresenceUnknown(t *testing.T) {
 	a := tabN(1, "workspace:1")
 	w := newWorld(a)
-	// 一覧作りの ps は通り、送る直前の確認で ps が失敗する
+	// The ps that builds the list passes; the ps fails in the check right before sending
 	w.onPsCall = func(w *world, n int) {
 		if n >= 2 {
 			w.psErr = errors.New("ps failed")
@@ -465,10 +465,10 @@ func TestRestoreSkipsWhenPresenceUnknown(t *testing.T) {
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if len(w.sends()) != 0 {
-		t.Errorf("判定できないのに送った: %v", w.sends())
+		t.Errorf("sent although it could not be decided: %v", w.sends())
 	}
 	if state := loadState(h.env.StatePath); state.Attempts[a.uuid] != 0 {
-		t.Errorf("試行回数に数えた: %v", state.Attempts)
+		t.Errorf("counted as an attempt: %v", state.Attempts)
 	}
 }
 
@@ -480,30 +480,30 @@ func TestRestoreSkipsWhenForegroundNotShell(t *testing.T) {
 	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{a.uuid: 1}})
 	mustRestore(t, h, defaultOptions())
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
-		t.Errorf("送信先 %v", got)
+		t.Errorf("sent to %v", got)
 	}
 	if got := loadState(h.env.StatePath).Attempts[a.uuid]; got != 1 {
-		t.Errorf("前面がシェルでないタブの試行回数が %d（1 のまま数えない）", got)
+		t.Errorf("attempts of a tab whose foreground is not a shell is %d (must stay 1)", got)
 	}
-	if !h.logged("スキップ surface:1 前面がシェルだけと確かめられない（busy）") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("skip surface:1 cannot confirm only a shell is in the foreground (busy)") {
+		t.Errorf("log %v", h.logs)
 	}
 }
 
 func TestRestoreSkipsWhenTtyPointsToOtherTab(t *testing.T) {
 	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
 	w := newWorld(a, b)
-	w.ttyEnv[a.tty] = "vim CMUX_SURFACE_ID=4DE01DAC-A9A7-4308-939C-763E5880CFA0" // 古い tty
+	w.ttyEnv[a.tty] = "vim CMUX_SURFACE_ID=4DE01DAC-A9A7-4308-939C-763E5880CFA0" // stale tty
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
-		t.Errorf("送信先 %v", got)
+		t.Errorf("sent to %v", got)
 	}
 	if got := loadState(h.env.StatePath).Attempts[a.uuid]; got != 0 {
-		t.Errorf("tty が別のタブを指すタブの試行回数が %d", got)
+		t.Errorf("attempts of a tab whose tty points at another tab is %d", got)
 	}
-	if !h.logged("スキップ surface:1 前面がシェルだけと確かめられない（unknown）") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("skip surface:1 cannot confirm only a shell is in the foreground (unknown)") {
+		t.Errorf("log %v", h.logs)
 	}
 }
 
@@ -514,7 +514,7 @@ func TestRestoreSkipsWhenNoTty(t *testing.T) {
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if len(w.sends()) != 0 {
-		t.Errorf("tty が無いのに送った")
+		t.Errorf("sent although there is no tty")
 	}
 }
 
@@ -522,14 +522,14 @@ func TestRestoreSelectsByKind(t *testing.T) {
 	a, b, c, d := tabN(1, "workspace:1"), tabN(2, "workspace:1"), tabN(3, "workspace:1"), tabN(4, "workspace:1")
 	b.kind = "codex"
 	c.kind = "gemini"
-	d.kind = "" // 記録なし
+	d.kind = "" // no record
 	br := tabN(5, "workspace:1")
 	br.browser = true
 	w := newWorld(a, b, c, d, br)
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if got := w.sends(); !slices.Equal(got, []string{"surface:1", "surface:2"}) {
-		t.Errorf("送信先 %v", got)
+		t.Errorf("sent to %v", got)
 	}
 }
 
@@ -542,7 +542,7 @@ func TestRestoreKindsOption(t *testing.T) {
 	opt.Kinds = []string{"opencode"}
 	mustRestore(t, h, opt)
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
-		t.Errorf("送信先 %v", got)
+		t.Errorf("sent to %v", got)
 	}
 }
 
@@ -553,17 +553,17 @@ func TestRestoreDoesNotReadRecordOfTabWithAgent(t *testing.T) {
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if slices.Contains(w.kindsRead, "surface:1") {
-		t.Error("エージェントがいるタブの復元記録を読んだ")
+		t.Error("read the restore record of a tab with an agent")
 	}
 }
 
 func TestRestoreDoesNothingWhenCmuxDoesNotRespond(t *testing.T) {
 	w := newWorld(tabN(1, "workspace:1"))
-	w.treeErr = errors.New("cmux が応答しない")
+	w.treeErr = errors.New("cmux does not answer")
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if len(w.events) != 0 || w.psCalls != 0 || len(h.logs) != 0 {
-		t.Errorf("何もしないはずが動いた: events=%v ps=%d logs=%v", w.events, w.psCalls, h.logs)
+		t.Errorf("should have done nothing but acted: events=%v ps=%d logs=%v", w.events, w.psCalls, h.logs)
 	}
 }
 
@@ -572,10 +572,10 @@ func TestRestoreFailsWhenPsFails(t *testing.T) {
 	w.psErr = errors.New("ps failed")
 	h := newHarness(t, w)
 	if err := Restore(h.env, defaultOptions()); err == nil {
-		t.Error("ps が失敗したのに error にならなかった")
+		t.Error("ps failed but no error was returned")
 	}
 	if len(w.sends()) != 0 {
-		t.Error("ps が失敗したのに送った")
+		t.Error("sent although ps failed")
 	}
 }
 
@@ -586,10 +586,10 @@ func TestRestoreCountsAttemptEvenWhenSendFails(t *testing.T) {
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if got := loadState(h.env.StatePath).Attempts[a.uuid]; got != 1 {
-		t.Errorf("送信が失敗しても試行に数える（シェルに打ち込めた可能性があるため）: %d", got)
+		t.Errorf("a failed send still counts as an attempt (the command may have reached the shell): %d", got)
 	}
-	if !h.logged("WARN 送信 surface:1 failed") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("WARN send surface:1 failed") {
+		t.Errorf("log %v", h.logs)
 	}
 }
 
@@ -600,7 +600,7 @@ func TestRestoreClearsStatusInEveryWorkspace(t *testing.T) {
 	mustRestore(t, h, defaultOptions())
 	for _, ws := range []string{"workspace:1", "workspace:2"} {
 		if !slices.Contains(w.events, "clear-status "+ws) {
-			t.Errorf("%s の表示を消していない: %v", ws, w.events)
+			t.Errorf("did not clear the display of %s: %v", ws, w.events)
 		}
 	}
 }
@@ -611,20 +611,20 @@ func TestRestoreDoesNotSendToTabRunningCodex(t *testing.T) {
 	w := newWorld(a, b)
 	w.agents[a.uuid] = true
 	w.agentCmd[a.uuid] = "/Users/andy/.local/bin/codex resume x"
-	// Codex が前面にいるタブ。記録は codex のまま
+	// A tab with Codex in front. The record stays codex
 	w.ttyPs[a.tty] = "1 Ss -/bin/zsh\n2 S+ codex\n"
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
-		t.Errorf("送信先 %v, want [surface:2]（Codex が動いているタブには送らない）", got)
+		t.Errorf("sent to %v, want [surface:2] (no send to a tab where Codex is running)", got)
 	}
 }
 
 func TestRestoreSkipsWhenAgentAppearsOnlyAtSecondCheck(t *testing.T) {
 	a := tabN(1, "workspace:1")
 	w := newWorld(a)
-	// ps -axo は、最初の一覧（1 回目）→ 送る直前の確認の 1 回目（2 回目）・2 回目（3 回目）の順に呼ばれる。
-	// 3 回目で初めてエージェントが見える
+	// ps -axo is called in this order: the first list (1st), the first check before sending (2nd), the second check (3rd).
+	// The agent becomes visible only on the 3rd
 	w.onPsCall = func(w *world, n int) {
 		if n == 3 {
 			w.agents[a.uuid] = true
@@ -633,39 +633,39 @@ func TestRestoreSkipsWhenAgentAppearsOnlyAtSecondCheck(t *testing.T) {
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if len(w.sends()) != 0 {
-		t.Errorf("2 回目の確認で見えたのに送った: %v", w.sends())
+		t.Errorf("sent although the second check saw an agent: %v", w.sends())
 	}
-	if !h.logged("エージェントが起動済み") {
-		t.Errorf("ログ %v", h.logs)
+	if !h.logged("agent already running") {
+		t.Errorf("log %v", h.logs)
 	}
 	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
-		t.Errorf("試行回数 %d, want 0", n)
+		t.Errorf("attempts %d, want 0", n)
 	}
 }
 
 func TestRestoreSkipsTabsSharingATty(t *testing.T) {
-	// ログイン・zsh の行には CMUX_SURFACE_ID が出ないので、別のタブの古い tty は ps だけでは見分けられない。
-	// tree の中で同じ tty を 2 つ以上のタブが名乗っていたら、どちらが本物か分からないので送らない
+	// Login and zsh lines carry no CMUX_SURFACE_ID, so a stale tty of another tab cannot be told apart by ps alone.
+	// If two or more tabs in the tree claim the same tty, we cannot tell which is real, so do not send
 	a, b, c := tabN(1, "workspace:1"), tabN(2, "workspace:1"), tabN(3, "workspace:1")
 	b.tty = a.tty
 	w := newWorld(a, b, c)
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if got := w.sends(); !slices.Equal(got, []string{"surface:3"}) {
-		t.Errorf("送信先 %v, want [surface:3]", got)
+		t.Errorf("sent to %v, want [surface:3]", got)
 	}
 	if !h.logged("share a tty") {
-		t.Errorf("ログ %v", h.logs)
+		t.Errorf("log %v", h.logs)
 	}
 	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
-		t.Errorf("送っていないタブの試行回数 %d, want 0", n)
+		t.Errorf("attempts of a tab not sent to %d, want 0", n)
 	}
 }
 
 func TestRestoreSkipsWhenTtyChangedSinceFirstTree(t *testing.T) {
 	a := tabN(1, "workspace:1")
 	w := newWorld(a)
-	// 1 回目の tree の後（送る直前の取り直し）で tty が変わる
+	// The tty changes after the first tree (the re-read right before sending)
 	w.onTreeCall = func(w *world, n int) {
 		if n >= 2 {
 			w.tabs[0].tty = "ttys999"
@@ -675,10 +675,10 @@ func TestRestoreSkipsWhenTtyChangedSinceFirstTree(t *testing.T) {
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if len(w.sends()) != 0 {
-		t.Errorf("tty が変わったのに送った: %v", w.sends())
+		t.Errorf("sent although the tty changed: %v", w.sends())
 	}
 	if !h.logged("tty changed since") {
-		t.Errorf("ログ %v", h.logs)
+		t.Errorf("log %v", h.logs)
 	}
 }
 
@@ -687,22 +687,22 @@ func TestRestoreSkipsWhenTabDisappearedSinceFirstTree(t *testing.T) {
 	w := newWorld(a, b)
 	w.onTreeCall = func(w *world, n int) {
 		if n == 2 {
-			w.tabs = w.tabs[1:] // surface:1 が閉じられた
+			w.tabs = w.tabs[1:] // surface:1 was closed
 		}
 	}
 	h := newHarness(t, w)
 	mustRestore(t, h, defaultOptions())
 	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
-		t.Errorf("送信先 %v, want [surface:2]", got)
+		t.Errorf("sent to %v, want [surface:2]", got)
 	}
 	if !h.logged("no longer exists") {
-		t.Errorf("ログ %v", h.logs)
+		t.Errorf("log %v", h.logs)
 	}
 }
 
 func TestRestoreKeepsAttemptsWhenRecordCannotBeRead(t *testing.T) {
-	// 記録が「読めなかった」ことと「記録が無い」ことは別。読めなかったタブの試行回数を消すと、
-	// 打ち切ったタブにまた送ってしまう
+	// "Could not read the record" differs from "no record". If the attempt count of an unreadable tab were removed,
+	// we would send again to a tab we had given up on
 	a, b, c := tabN(1, "workspace:1"), tabN(2, "workspace:1"), tabN(3, "workspace:1")
 	w := newWorld(a, b, c)
 	w.recordErr[a.uuid] = errors.New("cmux timed out")
@@ -712,31 +712,31 @@ func TestRestoreKeepsAttemptsWhenRecordCannotBeRead(t *testing.T) {
 	mustRestore(t, h, defaultOptions())
 	state := loadState(h.env.StatePath)
 	if state.Attempts[a.uuid] != 3 || state.Attempts[b.uuid] != 2 {
-		t.Errorf("読めなかったタブの試行回数が消えた・変わった: %v", state.Attempts)
+		t.Errorf("the attempt count of an unreadable tab was removed or changed: %v", state.Attempts)
 	}
 	if got := w.sends(); !slices.Equal(got, []string{"surface:3"}) {
-		t.Errorf("送信先 %v, want [surface:3]（読めなかったタブには送らない）", got)
+		t.Errorf("sent to %v, want [surface:3] (no send to an unreadable tab)", got)
 	}
 	if !h.logged("could not read the restore record") {
-		t.Errorf("ログ %v", h.logs)
+		t.Errorf("log %v", h.logs)
 	}
 }
 
 func TestRestoreCleansAttemptsWhenRecordIsGone(t *testing.T) {
 	a := tabN(1, "workspace:1")
-	a.kind = "" // 記録が無い（読めたうえで null）
+	a.kind = "" // no record (read fine, and null)
 	w := newWorld(a)
 	h := newHarness(t, w)
 	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{a.uuid: 2}})
 	mustRestore(t, h, defaultOptions())
 	if _, ok := loadState(h.env.StatePath).Attempts[a.uuid]; ok {
-		t.Error("記録が無くなったタブの試行回数が残っている")
+		t.Error("the attempt count of a tab whose record is gone remains")
 	}
 }
 
 func TestRestoreShowsTabsThatStayUnverifiable(t *testing.T) {
-	// 前面を確かめられない（tty が分からない）タブには送らない。それが続いても人が気づけるよう、
-	// 3 回続いたらサイドバーに出す。手で戻すタブ（Needs restore）とは文面を分ける
+	// Do not send to a tab whose foreground cannot be confirmed (the tty is unknown). So that a person notices if this goes on,
+	// show it in the sidebar after 3 runs in a row, worded differently from tabs to restore by hand (Needs restore)
 	a := tabN(1, "workspace:1")
 	a.tty = ""
 	w := newWorld(a)
@@ -750,14 +750,14 @@ func TestRestoreShowsTabsThatStayUnverifiable(t *testing.T) {
 		}
 		shown := slices.Contains(w.events, "set-status Cannot verify 1 workspace:1")
 		if shown != (run == 3) {
-			t.Errorf("run %d: サイドバーの表示 = %v, events = %v", run, shown, w.events)
+			t.Errorf("run %d: sidebar = %v, events = %v", run, shown, w.events)
 		}
 	}
 	if len(w.sends()) != 0 {
-		t.Errorf("確かめられないタブに送った: %v", w.sends())
+		t.Errorf("sent to a tab that could not be verified: %v", w.sends())
 	}
 	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
-		t.Errorf("試行回数 %d, want 0", n)
+		t.Errorf("attempts %d, want 0", n)
 	}
 }
 
@@ -766,9 +766,9 @@ func TestRestoreResetsUnverifiableCountWhenForegroundIsKnown(t *testing.T) {
 	w := newWorld(a)
 	h := newHarness(t, w)
 	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{}, UnknownStreak: map[string]int{a.uuid: 2}})
-	mustRestore(t, h, defaultOptions()) // 前面はシェルで確かめられ、送る
+	mustRestore(t, h, defaultOptions()) // the foreground is confirmed as a shell, so it sends
 	if _, ok := loadState(h.env.StatePath).UnknownStreak[a.uuid]; ok {
-		t.Error("確かめられたタブの連続回数が残っている")
+		t.Error("the streak of a tab that was verified remains")
 	}
 }
 

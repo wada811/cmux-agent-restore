@@ -8,12 +8,12 @@ import (
 	"time"
 )
 
-// Runner は外部コマンド（cmux・ps・launchctl）を 1 回実行して標準出力を返す。
-// 試験では差し替える。コマンドが失敗しても、出力が取れていれば出力と error の両方を返す
-// （ps -p は途中で終了した pid があると exit 1 になるが、出力は有効なため）。
+// Runner runs an external command (cmux, ps, launchctl) once and returns its stdout.
+// Tests replace it. When the command fails, it returns whatever output it got together with the error
+// (ps -p exits 1 if a pid ended midway, but its output is still valid). The error carries stderr.
 type Runner func(name string, args ...string) (string, error)
 
-// Presence はあるタブにエージェントがいるかの判定結果。
+// Presence is whether an agent is running on a tab.
 type Presence string
 
 const (
@@ -22,7 +22,7 @@ const (
 	Unknown Presence = "unknown"
 )
 
-// Foreground はタブの tty の前面がシェルだけかの判定結果。
+// Foreground is whether only a shell is in the foreground of a tab's tty.
 type Foreground string
 
 const (
@@ -31,10 +31,10 @@ const (
 	FgUnknown Foreground = "unknown"
 )
 
-// shells は前面にいてよいプロセスの名前。これ以外が前面なら送らない。
+// shells are the process names allowed in the foreground. If anything else is there, do not send.
 var shells = []string{"zsh", "bash", "sh", "dash", "fish"}
 
-// DefaultKinds は cmux restore を送る対象にする restore_record の kind。
+// DefaultKinds are the restore_record kinds that get a cmux restore.
 var DefaultKinds = []string{"claude", "codex"}
 
 func basename(p string) string {
@@ -44,7 +44,7 @@ func basename(p string) string {
 	return p
 }
 
-// AgentProcess は ps から拾ったエージェントの pid と種類。
+// AgentProcess is the pid and kind of an agent found in ps.
 type AgentProcess struct {
 	PID  string
 	Kind string
@@ -52,12 +52,13 @@ type AgentProcess struct {
 
 var psLineRe = regexp.MustCompile(`^(\d+)\s+(.*)$`)
 
-// agentKind は `ps -axo pid=,command=` の 1 行のコマンド部分から、エージェントの種類を返す。
-// エージェントでなければ空文字。
+// agentKind returns the kind of agent from the command part of one line of `ps -axo pid=,command=`,
+// or "" if it is not an agent.
 //
-// 実体 = 実行ファイルの名前（basename）が claude か codex（node 経由なら node の次の語）。
-// codex の常駐プロセス（`codex app-server …`・app-server-daemon 配下）と codex-code-mode-host は除く。
-// 常駐プロセスは古い CMUX_SURFACE_ID を持っているので、拾うと誤判定する。
+// An agent is a process whose executable name (basename) is claude or codex (the word after node,
+// if it runs through node). Codex's resident processes (`codex app-server ...`, anything under
+// app-server-daemon) and codex-code-mode-host are left out: they keep a stale CMUX_SURFACE_ID, so
+// counting them would give wrong answers.
 func agentKind(command string) string {
 	tokens := strings.Fields(command)
 	i := 0
@@ -83,7 +84,7 @@ func agentKind(command string) string {
 	return ""
 }
 
-// parseAgentProcesses は `ps -axo pid=,command=` の出力から、エージェントの pid と種類を拾う。
+// parseAgentProcesses picks the pid and kind of agents out of the output of `ps -axo pid=,command=`.
 func parseAgentProcesses(psOutput string) []AgentProcess {
 	var found []AgentProcess
 	for _, line := range strings.Split(psOutput, "\n") {
@@ -100,7 +101,7 @@ func parseAgentProcesses(psOutput string) []AgentProcess {
 
 var surfaceIDRe = regexp.MustCompile(`CMUX_SURFACE_ID=([0-9A-Fa-f-]{36})`)
 
-// parseSurfaceIDs は `ps eww` の出力から CMUX_SURFACE_ID の UUID（大文字）を集める。
+// parseSurfaceIDs collects the CMUX_SURFACE_ID UUIDs (upper case) from the output of `ps eww`.
 func parseSurfaceIDs(psEwwOutput string) map[string]bool {
 	found := map[string]bool{}
 	for _, m := range surfaceIDRe.FindAllStringSubmatch(psEwwOutput, -1) {
@@ -109,13 +110,13 @@ func parseSurfaceIDs(psEwwOutput string) map[string]bool {
 	return found
 }
 
-// surfacesWithAgent は、エージェント（claude・codex のどちらでも）が環境変数 CMUX_SURFACE_ID に
-// 持つ surface UUID（大文字）の集合を返す。ps 自体が失敗したら error。
+// surfacesWithAgent returns the set of surface UUIDs (upper case) found in the CMUX_SURFACE_ID
+// environment variable of agents (claude or codex). It fails if the first ps fails.
 func surfacesWithAgent(run Runner) (map[string]bool, error) {
 	out, err := run("ps", "-axo", "pid=,command=")
 	if err != nil {
-		// 一覧が欠けているかもしれないので、出力があっても失敗にする。
-		// 「いない」と誤って判定すると、動いているエージェントのタブに送ってしまう
+		// The list may be incomplete, so fail even if there is output. Wrongly deciding that no agent
+		// is there would send the command to a tab where an agent is running
 		return nil, err
 	}
 	procs := parseAgentProcesses(out)
@@ -126,14 +127,15 @@ func surfacesWithAgent(run Runner) (map[string]bool, error) {
 	for i, p := range procs {
 		pids[i] = p.PID
 	}
-	// 途中で終了した pid があると exit 1 になるが出力は有効なので、error は見ない
+	// exit 1 when a pid ended midway, but the output is still valid, so ignore the error
 	envOut, _ := run("ps", "eww", "-p", strings.Join(pids, ","), "-o", "command=")
 	return parseSurfaceIDs(envOut), nil
 }
 
-// checkAgentOnSurface は surface にエージェントがいるかを判定する。
-// いないと決めるのは、間隔を置いた 2 回とも見えなかったときだけ。
-// 判定できない場合（surfaceID が無い・ps が失敗）は Unknown で、呼び出し側は「いる」側に倒す。
+// checkAgentOnSurface decides whether an agent is on a surface.
+// It says Absent only when two looks, with a pause between them, both saw nothing.
+// When it cannot decide (no surfaceID, ps failed) it returns Unknown, and the caller treats that as
+// "an agent is there".
 func checkAgentOnSurface(surfaceID string, probe func() (map[string]bool, error), sleep func(time.Duration), interval time.Duration) Presence {
 	if surfaceID == "" {
 		return Unknown
@@ -157,9 +159,9 @@ func checkAgentOnSurface(surfaceID string, probe func() (map[string]bool, error)
 	return Absent
 }
 
-// selectTargets は復元を送る対象を選ぶ。
-// 対象 = restore_record の kind が kinds に含まれ、その surface にエージェントが（種類を問わず）いないタブ。
-// kindOf が空文字を返す（記録が無い・読めない）タブ、kind が不明なタブは対象にしない。
+// selectTargets picks the tabs to send a restore to.
+// A target is a tab whose restore_record kind is in kinds and where no agent (of any kind) is running.
+// Tabs for which kindOf returns "" (no record, or unreadable) and tabs with an unknown kind are not targets.
 func selectTargets(tabs []Tab, withAgent map[string]bool, kindOf func(Tab) string, kinds []string) []Tab {
 	var out []Tab
 	for _, t := range tabs {
@@ -176,10 +178,10 @@ func selectTargets(tabs []Tab, withAgent map[string]bool, kindOf func(Tab) strin
 
 var psTtyLineRe = regexp.MustCompile(`^\d+\s+(\S+)\s+(.+)$`)
 
-// classifyForeground は `ps -t <tty> -o pid=,stat=,comm=` の出力から、その tty の前面
-// （stat に + が付く）がシェルだけかを判定する。前面のプロセスが 1 つも見えなければ FgUnknown。
-// 環境変数は読まない（cmux 0.65.2 はシェルを root 所有の login の子として起動し、
-// シェルの環境変数が読めないため）。
+// classifyForeground decides from the output of `ps -t <tty> -o pid=,stat=,comm=` whether only a shell
+// is in the foreground of that tty (stat has a +). If no foreground process is visible, FgUnknown.
+// It does not read environment variables: cmux 0.65.2 starts the shell as a child of a root-owned
+// login, so the shell's environment cannot be read.
 func classifyForeground(psTtyOutput string) Foreground {
 	foreground := 0
 	for _, line := range strings.Split(psTtyOutput, "\n") {
@@ -199,8 +201,9 @@ func classifyForeground(psTtyOutput string) Foreground {
 	return FgUnknown
 }
 
-// ttyHasOtherSurface は `ps eww -t <tty> -o command=` の出力に、別の surface の
-// CMUX_SURFACE_ID を持つプロセスがあるかを返す。あれば `cmux tree` の tty が古く、別のタブを指している。
+// ttyHasOtherSurface reports whether the output of `ps eww -t <tty> -o command=` has a process with
+// another surface's CMUX_SURFACE_ID. If so, the tty in `cmux tree` is stale and points at another tab.
+// Login and shell lines carry no CMUX_SURFACE_ID, so this alone is not enough (see sharedTTYs).
 func ttyHasOtherSurface(psEwwOutput, surfaceID string) bool {
 	own := strings.ToUpper(surfaceID)
 	for _, m := range regexp.MustCompile(`CMUX_SURFACE_ID=([0-9A-Fa-f-]+)`).FindAllStringSubmatch(psEwwOutput, -1) {
@@ -213,8 +216,9 @@ func ttyHasOtherSurface(psEwwOutput, surfaceID string) bool {
 
 var ttyNameRe = regexp.MustCompile(`^[A-Za-z0-9]+$`)
 
-// foregroundOnTty は tty（`cmux tree` の surface.tty。例 ttys117）の前面がシェルだけかを実際の ps で確かめる。
-// tty が無い・ps が失敗した・その tty に別のタブのプロセスがいるときは FgUnknown。
+// foregroundOnTty checks with a real ps whether only a shell is in the foreground of a tty (the
+// surface.tty of `cmux tree`, for example ttys117). It returns FgUnknown when there is no tty, ps
+// fails, or the tty has a process from another tab.
 func foregroundOnTty(run Runner, tty, surfaceID string) Foreground {
 	if tty == "" || !ttyNameRe.MatchString(tty) {
 		return FgUnknown
@@ -233,7 +237,7 @@ func foregroundOnTty(run Runner, tty, surfaceID string) Foreground {
 	return classifyForeground(out)
 }
 
-var errNoCmux = errors.New("cmux が見つからない")
+var errNoCmux = errors.New("cmux not found")
 
 // sharedTTYs returns the ttys that two or more tabs claim in the tree.
 // A tab's tty in `cmux tree` can be stale and point at another tab's terminal. Login and shell

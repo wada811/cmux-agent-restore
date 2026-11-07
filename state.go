@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-// paths は状態・ログ・plist の置き場所。
+// paths are where the state, log and plist live.
 type paths struct {
 	home      string
 	stateDir  string
@@ -35,10 +35,10 @@ func defaultPaths(home string) paths {
 	}
 }
 
-// State は state.json の中身。
+// State is the contents of state.json.
 type State struct {
-	// Attempts は surface UUID → 復元コマンドを送った回数。
-	// エージェントが戻る・タブが消える・記録が無くなると外す。
+	// Attempts maps surface UUID to how many times the restore command was sent.
+	// An entry is removed when the agent comes back, the tab goes away, or the record is gone.
 	Attempts map[string]int `json:"attempts"`
 	// UnknownStreak is surface UUID -> how many runs in a row we could not confirm that the tab is
 	// safe to type into (unknown foreground, stale or shared tty). Dropped as soon as it is confirmed.
@@ -48,7 +48,7 @@ type State struct {
 	LastCompletedRun string `json:"last_completed_run,omitempty"`
 }
 
-// loadState は state.json を読む。無い・壊れている場合は空の状態。
+// loadState reads state.json. If it is missing or broken, it returns an empty state.
 func loadState(path string) State {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -67,7 +67,7 @@ func loadState(path string) State {
 	return s
 }
 
-// saveState は state.json を書く。途中で止められても壊れないよう、一時ファイルに書いて置き換える。
+// saveState writes state.json. It writes a temporary file and renames it, so being stopped midway cannot corrupt it.
 func saveState(path string, s State) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -83,10 +83,10 @@ func saveState(path string, s State) error {
 	return os.Rename(tmp, path)
 }
 
-var errLocked = errors.New("別のプロセスが実行中")
+var errLocked = errors.New("another process is running")
 
-// acquireLock は排他ロックを取る。取れなければ errLocked。返した関数でロックを手放す。
-// プロセスが死ねば OS がロックを外すので、ロックファイルが残っても詰まらない。
+// acquireLock takes an exclusive lock, or returns errLocked. Call the returned function to release it.
+// The OS drops the lock when the process dies, so a leftover lock file does not block anything.
 func acquireLock(path string) (release func(), err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err

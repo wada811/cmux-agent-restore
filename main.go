@@ -1,4 +1,4 @@
-// Command cmux-agent-restore は、cmux が戻し損ねた Claude Code・Codex のタブに cmux restore を送り直す。
+// Command cmux-agent-restore re-sends cmux restore to Claude Code and Codex tabs that cmux failed to restore.
 package main
 
 import (
@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-// version は GoReleaser が -ldflags で埋め込む。
+// version is set by GoReleaser through -ldflags.
 var version = "dev"
 
-// versionString は、ldflags が付かない `go install` のビルドではモジュールのバージョンを使う。
+// versionString uses the module version for `go install` builds, which carry no ldflags.
 func versionString() string {
 	if version != "dev" {
 		return version
@@ -29,7 +29,7 @@ func versionString() string {
 	return version
 }
 
-// deps は main が外に出る口。試験では差し替える。
+// deps is how main reaches the outside. Tests replace it.
 type deps struct {
 	run      Runner
 	paths    paths
@@ -61,7 +61,7 @@ func realDeps() deps {
 	}
 }
 
-// runFlags は run と install が共有するフラグの値。
+// runFlags are the flag values shared by run and install.
 type runFlags struct {
 	dryRun        bool
 	batch         int
@@ -76,15 +76,15 @@ func newFlagSet(name string, withDryRun, withInterval bool) (*flag.FlagSet, *run
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	if withDryRun {
-		fs.BoolVar(&f.dryRun, "dry-run", false, "送信も状態の更新もしない")
+		fs.BoolVar(&f.dryRun, "dry-run", false, "do not send or update state")
 	}
 	if withInterval {
-		fs.DurationVar(&f.interval, "interval", 5*time.Minute, "実行の間隔")
+		fs.DurationVar(&f.interval, "interval", 5*time.Minute, "interval between runs")
 	}
-	fs.IntVar(&f.batch, "batch", defaultBatch, "1 組あたりの送信数")
-	fs.DurationVar(&f.batchInterval, "batch-interval", defaultBatchInterval, "組と組の間隔")
-	fs.IntVar(&f.maxAttempts, "max-attempts", defaultMaxAttempts, "打ち切るまでの送信回数")
-	fs.StringVar(&f.kinds, "kinds", strings.Join(DefaultKinds, ","), "対象にする restore_record の kind（カンマ区切り）")
+	fs.IntVar(&f.batch, "batch", defaultBatch, "tabs to send to per batch")
+	fs.DurationVar(&f.batchInterval, "batch-interval", defaultBatchInterval, "pause between batches")
+	fs.IntVar(&f.maxAttempts, "max-attempts", defaultMaxAttempts, "sends before giving up on a tab")
+	fs.StringVar(&f.kinds, "kinds", strings.Join(DefaultKinds, ","), "restore_record kinds to target (comma separated)")
 	return fs, f
 }
 
@@ -98,23 +98,23 @@ func parseKinds(s string) []string {
 	return kinds
 }
 
-// options はフラグの値を検証して Options にする。
+// options validates the flag values and turns them into Options.
 func (f *runFlags) options() (Options, error) {
 	kinds := parseKinds(f.kinds)
 	switch {
 	case f.batch < 1:
-		return Options{}, errors.New("--batch は 1 以上にする")
+		return Options{}, errors.New("--batch must be 1 or more")
 	case f.maxAttempts < 1:
-		return Options{}, errors.New("--max-attempts は 1 以上にする")
+		return Options{}, errors.New("--max-attempts must be 1 or more")
 	case f.batchInterval < 0:
-		return Options{}, errors.New("--batch-interval は 0 以上にする")
+		return Options{}, errors.New("--batch-interval must be 0 or more")
 	case len(kinds) == 0:
-		return Options{}, errors.New("--kinds が空")
+		return Options{}, errors.New("--kinds is empty")
 	}
 	return Options{DryRun: f.dryRun, Batch: f.batch, BatchInterval: f.batchInterval, MaxAttempts: f.maxAttempts, Kinds: kinds}, nil
 }
 
-// setRunArgs は、明示されたフラグだけを install が plist の run の引数にするために並べる。
+// setRunArgs lists only the flags that were given explicitly, for install to put in the run arguments of the plist.
 func setRunArgs(fs *flag.FlagSet) []string {
 	var args []string
 	fs.Visit(func(fl *flag.Flag) {
@@ -127,13 +127,13 @@ func setRunArgs(fs *flag.FlagSet) []string {
 }
 
 func usageError(stderr io.Writer, msg string) int {
-	fmt.Fprintf(stderr, "cmux-agent-restore: %s\n%s\n詳しくは 'cmux-agent-restore --help' を見る。\n", msg, usageLine)
+	fmt.Fprintf(stderr, "cmux-agent-restore: %s\n%s\nSee 'cmux-agent-restore --help' for details.\n", msg, usageLine)
 	return 2
 }
 
 func execute(args []string, stdout, stderr io.Writer, d deps) int {
 	if len(args) == 0 {
-		return usageError(stderr, "サブコマンドを指定する")
+		return usageError(stderr, "give a subcommand")
 	}
 	switch args[0] {
 	case "--version", "-version", "version":
@@ -148,7 +148,7 @@ func execute(args []string, stdout, stderr io.Writer, d deps) int {
 		return cmdInstall(args[1:], stdout, stderr, d)
 	case "uninstall":
 		if len(args) > 1 {
-			return usageError(stderr, "uninstall に引数はない: "+strings.Join(args[1:], " "))
+			return usageError(stderr, "uninstall takes no arguments: "+strings.Join(args[1:], " "))
 		}
 		if err := uninstallAgent(d.run, d.paths, d.uid, stdout); err != nil {
 			fmt.Fprintln(stderr, "cmux-agent-restore:", err)
@@ -169,10 +169,10 @@ func execute(args []string, stdout, stderr io.Writer, d deps) int {
 		printStatus(d.run, d.paths, d.uid, *max, stdout)
 		return 0
 	}
-	return usageError(stderr, "不明なサブコマンド: "+args[0])
+	return usageError(stderr, "unknown subcommand: "+args[0])
 }
 
-// parseRunFlags は run・install のフラグを読む。終了コードが -1 なら続行する。
+// parseRunFlags reads the flags of run and install. If the exit code is -1, carry on.
 func parseRunFlags(name string, args []string, withDryRun, withInterval bool, stdout, stderr io.Writer) (*flag.FlagSet, *runFlags, Options, int) {
 	fs, f := newFlagSet(name, withDryRun, withInterval)
 	if err := fs.Parse(args); err != nil {
@@ -183,7 +183,7 @@ func parseRunFlags(name string, args []string, withDryRun, withInterval bool, st
 		return nil, nil, Options{}, usageError(stderr, err.Error())
 	}
 	if fs.NArg() > 0 {
-		return nil, nil, Options{}, usageError(stderr, "不明な引数: "+strings.Join(fs.Args(), " "))
+		return nil, nil, Options{}, usageError(stderr, "unexpected argument: "+strings.Join(fs.Args(), " "))
 	}
 	opt, err := f.options()
 	if err != nil {
@@ -192,7 +192,7 @@ func parseRunFlags(name string, args []string, withDryRun, withInterval bool, st
 	return fs, f, opt, -1
 }
 
-// lineLogger は時刻つきの行を stdout とログファイルに書く。dry-run ではファイルに書かない。
+// lineLogger writes timestamped lines to stdout and the log file. It does not write the file in dry-run.
 type lineLogger struct {
 	out    io.Writer
 	file   *os.File
@@ -219,18 +219,18 @@ func cmdRun(args []string, stdout, stderr io.Writer, d deps) int {
 	}
 	cmux, err := findCmux(d.lookPath, d.stat)
 	if err != nil {
-		fmt.Fprintf(stderr, "cmux-agent-restore: %v（PATH と %s を探した）\n", err, bundledCmux)
+		fmt.Fprintf(stderr, "cmux-agent-restore: %v (looked on PATH and at %s)\n", err, bundledCmux)
 		return 1
 	}
 	log := &lineLogger{out: stdout, dryRun: opt.DryRun, now: d.now}
 	if !opt.DryRun {
 		release, err := acquireLock(d.paths.lockFile)
 		if errors.Is(err, errLocked) {
-			fmt.Fprintln(stdout, "別のプロセスが実行中のため、何もしない")
+			fmt.Fprintln(stdout, "another process is running, doing nothing")
 			return 0
 		}
 		if err != nil {
-			fmt.Fprintf(stderr, "cmux-agent-restore: ロックを取れない: %v\n", err)
+			fmt.Fprintf(stderr, "cmux-agent-restore: could not take the lock: %v\n", err)
 			return 1
 		}
 		defer release()
@@ -258,11 +258,11 @@ func cmdInstall(args []string, stdout, stderr io.Writer, d deps) int {
 		return code
 	}
 	if f.interval < time.Minute {
-		return usageError(stderr, "--interval は 1m 以上にする")
+		return usageError(stderr, "--interval must be 1m or more")
 	}
 	exe, err := d.exe()
 	if err != nil {
-		fmt.Fprintf(stderr, "cmux-agent-restore: 実行ファイルの場所が分からない: %v\n", err)
+		fmt.Fprintf(stderr, "cmux-agent-restore: cannot find the executable: %v\n", err)
 		return 1
 	}
 	exe = stableExePath(exe, d.lookPath)
@@ -273,9 +273,9 @@ func cmdInstall(args []string, stdout, stderr io.Writer, d deps) int {
 	return 0
 }
 
-// stableExePath は、PATH 上の cmux-agent-restore が実行中のファイルと同じなら、PATH 上の場所を返す。
-// Homebrew は /opt/homebrew/bin に symlink を置くので、バージョンを含む実体の場所を plist に書くと
-// アップグレードで壊れる。
+// stableExePath returns the location on PATH if cmux-agent-restore on PATH is the same file as the one running.
+// Homebrew puts a symlink in /opt/homebrew/bin, so writing the versioned real path into the plist
+// would break on upgrade.
 func stableExePath(exe string, lookPath func(string) (string, error)) string {
 	p, err := lookPath(appName)
 	if err != nil {

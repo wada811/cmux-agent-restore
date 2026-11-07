@@ -2,48 +2,53 @@ package main
 
 const usageLine = "usage: cmux-agent-restore <run|install|uninstall|status> [flags] | --version | --help"
 
-// helpText は人にも LLM エージェントにも読める形で、何をするツールか・各値の意味・次にすることを書く。
-const helpText = `cmux-agent-restore - cmux が戻し損ねた Claude Code・Codex のタブに cmux restore を送り直す。
+// helpText is written to be read by people and by LLM agents: what the tool does, what each value
+// means, and what to do next.
+const helpText = `cmux-agent-restore - re-send "cmux restore" to Claude Code and Codex tabs that cmux failed to restore.
 
-cmux を再起動すると、復元記録（restore_record）があるのにエージェントが起動せず、
-シェルのまま止まるタブが出る。このツールは、そのタブのシェルに
-"cmux restore --surface <ref>" を打ち込んで戻す。
+After cmux restarts, some tabs have a restore record (restore_record) but the agent never
+starts and the tab stays at a bare shell. This tool types
+"cmux restore --surface <surface-uuid>" into the shell of such a tab to bring the agent back.
 
 ` + usageLine + `
 
-サブコマンド:
-  run         1 回見回って、戻し損ねたタブに送る
-  install     launchd の plist を ~/Library/LaunchAgents に書いて bootstrap する（既定 5 分間隔）
-  uninstall   launchd から外し、plist を消す
-  status      launchd の状態・最後の実行・state.json の中身を出す
+Subcommands:
+  run         Look over all tabs once and send the restore command to tabs that were not restored
+  install     Write a launchd plist to ~/Library/LaunchAgents and bootstrap it (every 5 minutes by default)
+  uninstall   Remove the job from launchd and delete the plist
+  status      Show the launchd state, the last run that finished, and the contents of state.json
 
-run のフラグ:
-  --dry-run              送信も状態の更新もせず、対象と判定だけを出す
-  --batch N              1 組あたりの送信数（既定 3）
-  --batch-interval DUR   組と組の間隔（既定 20s）。pool_saturated を避けるため
-  --max-attempts N       この回数送っても戻らないタブには送らず、サイドバーに出す（既定 3）
-  --kinds LIST           対象にする restore_record の kind（カンマ区切り。既定 claude,codex）
+Flags of run:
+  --dry-run              Do not send or update state; only print the targets and the checks
+  --batch N              How many tabs to send to per batch (default 3)
+  --batch-interval DUR   Pause between batches (default 20s), to avoid pool_saturated
+  --max-attempts N       Stop sending to a tab that has not come back after this many sends, and show
+                         it in the sidebar (default 3)
+  --kinds LIST           restore_record kinds to target (comma separated; default claude,codex)
 
-install のフラグ:
-  --interval DUR         実行の間隔（既定 5m）
-  --batch・--batch-interval・--max-attempts・--kinds
-                         指定したものだけ plist の run の引数に入れる
+Flags of install:
+  --interval DUR         Interval between runs (default 5m)
+  --batch, --batch-interval, --max-attempts, --kinds
+                         Only the ones you give are written into the run arguments of the plist
 
-status のフラグ:
-  --max-attempts N       打ち切りの判定に使う回数（既定 3）
+Flags of status:
+  --max-attempts N       Number of attempts used to decide a tab is given up on (default 3)
 
-送る条件（すべて満たすタブにだけ送る）:
-  1. 復元記録の kind が対象の種類
-  2. そのタブでエージェントが動いていない（送る直前に 1.5 秒あけて 2 回見て、2 回ともいない）
-  3. 前面のプロセスがシェルだけ（zsh・bash・sh・dash・fish）で、tty が別のタブを指していない
-  3 が確かめられないタブ（エディタが前面・Codex 実行中など）には送らず、試行回数にも数えない。
+When it sends (only to a tab that meets all of these):
+  1. The kind of its restore record is a targeted kind
+  2. No agent is running on the tab (checked twice, 1.5 seconds apart, right before sending)
+  3. Only a shell (zsh, bash, sh, dash, fish) is in the foreground, and the tty is not shared with or
+     taken over by another tab
+A tab where 3 cannot be confirmed (an editor in front, Codex running, and so on) gets nothing and the
+attempt is not counted. If that goes on for 3 runs in a row, the tab is shown in the sidebar as
+"cannot verify", separately from tabs that need a manual restore.
 
-置き場所:
-  状態  ~/Library/Application Support/cmux-agent-restore/state.json
-  ログ  ~/Library/Logs/cmux-agent-restore.log
-  cmux  PATH から探し、無ければ /Applications/cmux.app/Contents/Resources/bin/cmux
+Locations:
+  state  ~/Library/Application Support/cmux-agent-restore/state.json
+  log    ~/Library/Logs/cmux-agent-restore.log
+  cmux   Looked up on PATH, else /Applications/cmux.app/Contents/Resources/bin/cmux
 
 Options:
-  --version              バージョンを出して終わる
-  -h, --help             このヘルプを出す
+  --version              Print the version and exit
+  -h, --help             Print this help
 `

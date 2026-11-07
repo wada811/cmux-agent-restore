@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// 既定値。フラグで上書きできる。
+// Defaults. Flags can override them.
 const (
 	defaultBatch         = 3
 	defaultBatchInterval = 20 * time.Second
@@ -17,7 +17,7 @@ const (
 	unknownLimit = 3
 )
 
-// Options は run のフラグ。
+// Options are the flags of run.
 type Options struct {
 	DryRun        bool
 	Batch         int
@@ -30,7 +30,7 @@ func defaultOptions() Options {
 	return Options{Batch: defaultBatch, BatchInterval: defaultBatchInterval, MaxAttempts: defaultMaxAttempts, Kinds: DefaultKinds}
 }
 
-// Env は run が外に出る口。試験では差し替える。
+// Env is how run reaches the outside. Tests replace it.
 type Env struct {
 	Run              Runner
 	Cmux             string
@@ -41,7 +41,7 @@ type Env struct {
 	PresenceInterval time.Duration
 }
 
-// listTerminalTabs は全 workspace の ref と terminal タブの一覧を返す。cmux が応答しなければ ok=false。
+// listTerminalTabs returns the refs of all workspaces and the list of terminal tabs. ok is false if cmux does not answer.
 func (e *Env) listTerminalTabs() (workspaceRefs []string, tabs []Tab, ok bool) {
 	out, err := e.Run(e.Cmux, "tree", "--all", "--id-format", "both", "--json")
 	if err != nil {
@@ -81,7 +81,7 @@ func (e *Env) recheckTab(t Tab) (fresh Tab, reason string, unverifiable bool) {
 	return *cur, "", false
 }
 
-// warn は失敗を WARN として記録する。
+// warn logs a failure as WARN.
 func (e *Env) warn(what string, err error) {
 	msg := err.Error()
 	if i := strings.Index(msg, "\n"); i >= 0 {
@@ -90,22 +90,23 @@ func (e *Env) warn(what string, err error) {
 	e.Logf("WARN %s failed: %s", what, msg)
 }
 
-// Restore は 1 回見回って、戻し損ねたタブに cmux restore を送る。
-//
-//   - 対象 = 復元記録（restore_record.checkpoint_id）があり、その kind が Kinds に含まれ、
-//     エージェント（種類を問わない）のプロセスがいない terminal タブ。kind が不明・読めないタブは送らない
-//   - エージェントの有無は tty で判定しない（`cmux tree` の tty は古いことがある）。
-//     各 pid の環境変数 CMUX_SURFACE_ID を読み、tree の surface UUID と突き合わせる
-//   - 対象の一覧は最初に 1 回だけ作り、送り終えるまで数分かかる。その間にエージェントが起動する
-//     ので、タブごとに送る直前に checkAgentOnSurface で確かめ直し、いないと確かめられたタブにだけ送る。
-//     加えて、そのタブの前面がシェルだけであること（foregroundOnTty）も確かめる。
-//     いる・判定できない・前面がシェルでないタブはその回は送らず、試行回数にも数えない
-//   - 一斉復元で pool_saturated になった実績があるので、Batch 件ずつ BatchInterval あけて送る
-//   - 失敗の種類は見分けない。MaxAttempts 回送っても戻らないタブは送るのをやめる
-//     （シェルに同じコマンドを打ち込み続けないため）。表示だけ、そのタブのある workspace の
-//     サイドバーに agent_restore として残す。workspace の ref は cmux の再起動で変わるので、
-//     どこに出したかは覚えず、毎回すべての workspace について出す・消すを決め直す
-//   - cmux が応答しなければ何もしない
+// Restore looks over the tabs once and sends cmux restore to tabs that were not restored.
+//   - Targets: terminal tabs that have a restore record (restore_record.checkpoint_id) whose kind is in
+//     Kinds and where no agent process (of any kind) runs. Tabs with an unknown or unreadable kind get nothing.
+//   - Whether an agent is there is not decided by tty (the tty in `cmux tree` can be stale). It reads
+//     CMUX_SURFACE_ID from each agent pid and matches it with the surface UUIDs of the tree.
+//   - The target list is built once, and sending takes minutes, during which an agent may start. So just
+//     before sending to each tab, checkAgentOnSurface looks again, and we send only if it is confirmed absent.
+//     The tab's foreground must also be only a shell (foregroundOnTty), and the tree is re-read to confirm
+//     the tab still exists with the same tty.
+//     Tabs with an agent, tabs we cannot decide on, and tabs whose foreground is not a shell are skipped
+//     for this run and do not count as an attempt.
+//   - Restoring everything at once has hit pool_saturated, so send Batch tabs at a time, BatchInterval apart.
+//   - Kinds of failure are not told apart. A tab that has not come back after MaxAttempts sends is not sent
+//     to any more (to stop typing the same command into a shell). It is only shown in the sidebar of its
+//     workspace as agent_restore. Workspace refs change when cmux restarts, so where it was shown is not
+//     remembered; every run decides again, for all workspaces, whether to show or clear it.
+//   - If cmux does not answer, do nothing.
 func Restore(env *Env, opt Options) error {
 	workspaceRefs, tabs, ok := env.listTerminalTabs()
 	if !ok {
@@ -114,12 +115,12 @@ func Restore(env *Env, opt Options) error {
 
 	withAgent, err := surfacesWithAgent(env.Run)
 	if err != nil {
-		return fmt.Errorf("ps の実行に失敗: %w", err)
+		return fmt.Errorf("ps failed: %w", err)
 	}
 	state := loadState(env.StatePath)
 
-	// エージェントがいないタブのうち、対象の種類の復元記録があるものが対象。
-	// 記録は、エージェントがいるタブでは読まない
+	// Targets are the tabs with no agent that have a restore record of a targeted kind.
+	// Records are not read for tabs where an agent is running.
 	var candidates []Tab
 	for _, t := range tabs {
 		if !withAgent[strings.ToUpper(t.UUID)] {
@@ -166,9 +167,9 @@ func Restore(env *Env, opt Options) error {
 			delete(state.UnknownStreak, uuid)
 		}
 	}
-	env.Logf("対象 %d 件（送信 %d・戻らない %d）", len(targets), len(toSend), len(stuck))
+	env.Logf("targets %d (to send %d, given up %d)", len(targets), len(toSend), len(stuck))
 	for _, t := range targets {
-		env.Logf("  %s %s %s 試行 %d/%d", t.Ref, t.UUID, kinds[t.UUID], state.Attempts[t.UUID], opt.MaxAttempts)
+		env.Logf("  %s %s %s attempts %d/%d", t.Ref, t.UUID, kinds[t.UUID], state.Attempts[t.UUID], opt.MaxAttempts)
 	}
 
 	save := func() {
@@ -176,14 +177,14 @@ func Restore(env *Env, opt Options) error {
 			return
 		}
 		if err := saveState(env.StatePath, state); err != nil {
-			env.warn("状態の保存", err)
+			env.warn("saving state", err)
 		}
 	}
 
 	probe := func() (map[string]bool, error) { return surfacesWithAgent(env.Run) }
 	sentInPrevBatch := false
 	for i := 0; i < len(toSend); i += opt.Batch {
-		// 送っていない組（エージェントが起動済み）の後は待たない。pool_saturated を避ける間隔は送信にだけ要る
+		// Do not wait after a batch that sent nothing (agents had already started). The pause that avoids pool_saturated is only needed after sending
 		if sentInPrevBatch && !opt.DryRun {
 			env.Sleep(opt.BatchInterval)
 		}
@@ -193,11 +194,11 @@ func Restore(env *Env, opt Options) error {
 			presence := checkAgentOnSurface(t.UUID, probe, env.Sleep, env.PresenceInterval)
 			if presence != Absent {
 				if presence == Present {
-					env.Logf("スキップ %s エージェントが起動済み", t.Ref)
+					env.Logf("skip %s agent already running", t.Ref)
 					delete(state.Attempts, t.UUID)
 					delete(state.UnknownStreak, t.UUID)
 				} else {
-					env.Logf("スキップ %s エージェントの有無を判定できない", t.Ref)
+					env.Logf("skip %s cannot tell whether an agent is running", t.Ref)
 				}
 				continue
 			}
@@ -211,7 +212,7 @@ func Restore(env *Env, opt Options) error {
 				continue
 			}
 			if fg := foregroundOnTty(env.Run, fresh.TTY, t.UUID); fg != FgShell {
-				env.Logf("スキップ %s 前面がシェルだけと確かめられない（%s）", t.Ref, fg)
+				env.Logf("skip %s cannot confirm only a shell is in the foreground (%s)", t.Ref, fg)
 				if fg == FgUnknown {
 					state.UnknownStreak[t.UUID]++
 				} else {
@@ -221,22 +222,22 @@ func Restore(env *Env, opt Options) error {
 			}
 			delete(state.UnknownStreak, t.UUID)
 			if opt.DryRun {
-				env.Logf("再確認 %s エージェントがいない・前面はシェル（dry-run のため送らない）", t.Ref)
+				env.Logf("recheck %s no agent, shell in the foreground (dry-run, not sending)", t.Ref)
 				continue
 			}
 			state.Attempts[t.UUID]++
 			sentInPrevBatch = true
 			if _, err := env.Run(env.Cmux, "send", "--surface", t.UUID, "cmux restore --surface "+t.UUID); err != nil {
-				env.warn("送信 "+t.Ref, err)
+				env.warn("send "+t.Ref, err)
 				continue
 			}
 			if _, err := env.Run(env.Cmux, "send-key", "--surface", t.UUID, "enter"); err != nil {
-				env.warn("送信 "+t.Ref, err)
+				env.warn("send "+t.Ref, err)
 				continue
 			}
-			env.Logf("送信 %s %d/%d", t.Ref, state.Attempts[t.UUID], opt.MaxAttempts)
+			env.Logf("sent %s %d/%d", t.Ref, state.Attempts[t.UUID], opt.MaxAttempts)
 		}
-		// timeout で止められても試行回数が残るよう、組ごとに書く
+		// Save after every batch so the attempt counts survive being stopped by a timeout
 		save()
 	}
 

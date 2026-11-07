@@ -12,13 +12,13 @@ import (
 	"time"
 )
 
-// bundledCmux は PATH に cmux が無いときに使う、cmux.app 同梱の CLI。
+// bundledCmux is the CLI inside cmux.app, used when cmux is not on PATH.
 const bundledCmux = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 
-// commandTimeout は外部コマンド 1 回の上限。
+// commandTimeout is the limit for one external command.
 const commandTimeout = 15 * time.Second
 
-// findCmux は cmux の場所を返す。PATH から探し、無ければ cmux.app 同梱の CLI。
+// findCmux returns where cmux is: on PATH, or else the CLI inside cmux.app.
 func findCmux(lookPath func(string) (string, error), stat func(string) (os.FileInfo, error)) (string, error) {
 	if p, err := lookPath("cmux"); err == nil {
 		return p, nil
@@ -29,12 +29,12 @@ func findCmux(lookPath func(string) (string, error), stat func(string) (os.FileI
 	return "", errNoCmux
 }
 
-// execRunner は実際にコマンドを実行する Runner。失敗しても取れた出力は返す。
+// execRunner is the Runner that really runs commands. It returns what it got on stdout even on failure.
 func execRunner(name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	// 起動元が持つ Node のフラグ（--require など）を cmux の CLI に引き継がない
+	// Do not pass the caller's Node flags (--require and so on) on to the cmux CLI
 	cmd.Env = append(os.Environ(), "NODE_OPTIONS=")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -60,7 +60,7 @@ func (e *cmdError) Error() string {
 
 func (e *cmdError) Unwrap() error { return e.err }
 
-// Tab は cmux tree の terminal タブ。
+// Tab is a terminal tab in `cmux tree`.
 type Tab struct {
 	UUID         string
 	Ref          string
@@ -84,7 +84,7 @@ type treeJSON struct {
 	} `json:"windows"`
 }
 
-// parseTree は `cmux tree --all --json` の出力から、全 workspace の ref と terminal タブの一覧を作る。
+// parseTree builds the refs of all workspaces and the list of terminal tabs from `cmux tree --all --json`.
 func parseTree(out string) (workspaceRefs []string, tabs []Tab, err error) {
 	var tree treeJSON
 	if err := json.Unmarshal([]byte(out), &tree); err != nil {
@@ -128,7 +128,7 @@ func parseRestoreKind(out string) (string, error) {
 	return fmt.Sprint(j.RestoreRecord.Kind), nil
 }
 
-// truthyEmpty は JSON の値が null・空文字・false・0 のとき true（JavaScript の falsy に合わせる）。
+// truthyEmpty is true when a JSON value is null, an empty string, false or 0 (like JavaScript falsy).
 func truthyEmpty(v any) bool {
 	switch x := v.(type) {
 	case nil:

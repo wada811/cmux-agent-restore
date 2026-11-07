@@ -27,22 +27,22 @@ func TestParseTree(t *testing.T) {
 		t.Errorf("workspace %v", refs)
 	}
 	if len(tabs) != 2 || tabs[1].WorkspaceRef != "workspace:2" || tabs[0].TTY != "ttys001" {
-		t.Errorf("tabs %+v（terminal だけを拾う）", tabs)
+		t.Errorf("tabs %+v (only terminals are picked)", tabs)
 	}
 	if _, _, err := parseTree("not json"); err == nil {
-		t.Error("壊れた JSON が error にならなかった")
+		t.Error("broken JSON did not give an error")
 	}
 }
 
 func TestParseRestoreKind(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"claude", `{"restore_record":{"checkpoint_id":"c1","kind":"claude"}}`, "claude"},
-		{"checkpoint_id が無ければ記録なし", `{"restore_record":{"kind":"claude"}}`, ""},
-		{"checkpoint_id が空なら記録なし", `{"restore_record":{"checkpoint_id":"","kind":"claude"}}`, ""},
-		{"記録が null", `{"restore_record":null}`, ""},
-		{"記録の項目が無い", `{}`, ""},
-		{"kind が無ければ unknown", `{"restore_record":{"checkpoint_id":"c1"}}`, "unknown"},
-		{"壊れた JSON", `oops`, ""},
+		{"no record without checkpoint_id", `{"restore_record":{"kind":"claude"}}`, ""},
+		{"no record if checkpoint_id is empty", `{"restore_record":{"checkpoint_id":"","kind":"claude"}}`, ""},
+		{"record is null", `{"restore_record":null}`, ""},
+		{"no record fields", `{}`, ""},
+		{"unknown without kind", `{"restore_record":{"checkpoint_id":"c1"}}`, "unknown"},
+		{"broken JSON", `oops`, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -51,7 +51,7 @@ func TestParseRestoreKind(t *testing.T) {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 			if (err != nil) != (c.in == "oops") {
-				t.Errorf("err = %v（読めない出力のときだけ error にする）", err)
+				t.Errorf("err = %v (error only for unreadable output)", err)
 			}
 		})
 	}
@@ -64,32 +64,32 @@ func TestFindCmux(t *testing.T) {
 	statNG := func(string) (os.FileInfo, error) { return nil, errors.New("no") }
 
 	if p, err := findCmux(found, statNG); err != nil || p != "/opt/homebrew/bin/cmux" {
-		t.Errorf("PATH から探す: %q %v", p, err)
+		t.Errorf("found on PATH: %q %v", p, err)
 	}
 	if p, err := findCmux(missing, statOK); err != nil || p != bundledCmux {
-		t.Errorf("PATH に無ければ同梱の CLI: %q %v", p, err)
+		t.Errorf("bundled CLI if not on PATH: %q %v", p, err)
 	}
 	if _, err := findCmux(missing, statNG); !errors.Is(err, errNoCmux) {
-		t.Errorf("どちらも無ければ error: %v", err)
+		t.Errorf("error if neither exists: %v", err)
 	}
 }
 
 func TestStateRoundTrip(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "sub", "state.json")
 	if s := loadState(p); len(s.Attempts) != 0 {
-		t.Errorf("無いファイルは空の状態: %v", s)
+		t.Errorf("a missing file gives an empty state: %v", s)
 	}
 	if err := saveState(p, State{Attempts: map[string]int{"U": 2}, LastCompletedRun: "x"}); err != nil {
 		t.Fatal(err)
 	}
 	if s := loadState(p); s.Attempts["U"] != 2 || s.LastCompletedRun != "x" {
-		t.Errorf("読み戻せない: %v", s)
+		t.Errorf("cannot read back: %v", s)
 	}
 	if err := os.WriteFile(p, []byte("{broken"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if s := loadState(p); s.Attempts == nil || len(s.Attempts) != 0 {
-		t.Errorf("壊れたファイルは空の状態: %v", s)
+		t.Errorf("a broken file gives an empty state: %v", s)
 	}
 }
 
@@ -100,12 +100,12 @@ func TestLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := acquireLock(p); !errors.Is(err, errLocked) {
-		t.Errorf("二重に取れた: %v", err)
+		t.Errorf("taken twice: %v", err)
 	}
 	release()
 	release2, err := acquireLock(p)
 	if err != nil {
-		t.Fatalf("手放したのに取れない: %v", err)
+		t.Fatalf("cannot take after release: %v", err)
 	}
 	release2()
 }
@@ -122,7 +122,7 @@ func TestPlistXML(t *testing.T) {
 		"/Users/a&amp;b/Library/Logs/cmux-agent-restore.err.log",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("plist に %q が無い:\n%s", want, got)
+			t.Errorf("plist lacks %q:\n%s", want, got)
 		}
 	}
 }
@@ -190,14 +190,14 @@ func TestInstallFresh(t *testing.T) {
 	}
 	fi, err := os.Lstat(p.plistFile)
 	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("plist が実ファイルで書かれていない: %v", err)
+		t.Fatalf("plist was not written as a regular file: %v", err)
 	}
 	b, _ := os.ReadFile(p.plistFile)
 	if !strings.Contains(string(b), "<integer>600</integer>") || !strings.Contains(string(b), "<string>claude</string>") {
 		t.Errorf("plist %s", b)
 	}
 	if _, err := os.Stat(p.plistFile + ".tmp"); !os.IsNotExist(err) {
-		t.Error("一時ファイルが残っている")
+		t.Error("a temporary file remains")
 	}
 }
 
@@ -212,10 +212,10 @@ func TestWriteFileAtomicReplacesSymlink(t *testing.T) {
 	}
 	fi, _ := os.Lstat(link)
 	if fi.Mode()&os.ModeSymlink != 0 {
-		t.Error("symlink のまま")
+		t.Error("still a symlink")
 	}
 	if b, _ := os.ReadFile(real); string(b) != "old" {
-		t.Errorf("symlink の先を書き換えた: %q", b)
+		t.Errorf("rewrote the symlink target: %q", b)
 	}
 }
 
@@ -225,13 +225,13 @@ func TestInstallWaitsForBootoutToFinish(t *testing.T) {
 	var slept int
 	sleep := func(time.Duration) { slept++ }
 	if err := installAgent(f.run, sleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err != nil {
-		t.Fatalf("bootout が遅れても成功するはず: %v", err)
+		t.Fatalf("should succeed even if bootout is slow: %v", err)
 	}
 	if slept < 3 {
-		t.Errorf("print が失敗するまで待っていない（待ち %d 回）", slept)
+		t.Errorf("did not wait until print fails (%d waits)", slept)
 	}
 	if !f.loaded {
-		t.Error("読み込まれていない")
+		t.Error("not loaded")
 	}
 }
 
@@ -239,7 +239,7 @@ func TestInstallRetriesBootstrap(t *testing.T) {
 	p := defaultPaths(t.TempDir())
 	f := &fakeLaunchctl{bootstrapFails: 2}
 	if err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err != nil {
-		t.Fatalf("2 回失敗しても 3 回目で通るはず: %v", err)
+		t.Fatalf("should pass on the third try after two failures: %v", err)
 	}
 	n := 0
 	for _, c := range f.calls {
@@ -248,7 +248,7 @@ func TestInstallRetriesBootstrap(t *testing.T) {
 		}
 	}
 	if n != 3 {
-		t.Errorf("bootstrap %d 回, want 3", n)
+		t.Errorf("%d bootstraps, want 3", n)
 	}
 }
 
@@ -256,16 +256,16 @@ func TestInstallRestoresPreviousPlistWhenBootstrapFails(t *testing.T) {
 	p := defaultPaths(t.TempDir())
 	_ = os.MkdirAll(filepath.Dir(p.plistFile), 0o755)
 	_ = os.WriteFile(p.plistFile, []byte("OLD PLIST"), 0o644)
-	f := &fakeLaunchctl{loaded: true, bootstrapFails: bootstrapTries} // 新しい plist の bootstrap だけ失敗し、元のは通る
+	f := &fakeLaunchctl{loaded: true, bootstrapFails: bootstrapTries} // only the bootstrap of the new plist fails; the original one passes
 	err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{})
 	if err == nil {
-		t.Fatal("bootstrap の失敗が error にならなかった")
+		t.Fatal("a bootstrap failure did not give an error")
 	}
 	if b, _ := os.ReadFile(p.plistFile); string(b) != "OLD PLIST" {
-		t.Errorf("元の plist が戻っていない: %q", b)
+		t.Errorf("the original plist was not restored: %q", b)
 	}
 	if !f.loaded || len(f.bootstrapped) != 1 || f.bootstrapped[0] != "OLD PLIST" {
-		t.Errorf("元の plist を読み込み直していない: loaded=%v bootstrapped=%q", f.loaded, f.bootstrapped)
+		t.Errorf("did not reload the original plist: loaded=%v bootstrapped=%q", f.loaded, f.bootstrapped)
 	}
 	if !strings.Contains(err.Error(), "previous plist was put back") {
 		t.Errorf("error %v", err)
@@ -276,10 +276,10 @@ func TestInstallRemovesNewPlistWhenThereWasNoPreviousAndBootstrapFails(t *testin
 	p := defaultPaths(t.TempDir())
 	f := &fakeLaunchctl{bootstrapFails: -1}
 	if err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err == nil {
-		t.Fatal("error にならなかった")
+		t.Fatal("no error was returned")
 	}
 	if _, err := os.Stat(p.plistFile); !os.IsNotExist(err) {
-		t.Error("失敗した plist が残っている")
+		t.Error("the failed plist remains")
 	}
 }
 
@@ -287,7 +287,7 @@ func TestInstallFailsWhenJobStaysRegistered(t *testing.T) {
 	p := defaultPaths(t.TempDir())
 	f := &fakeLaunchctl{loaded: true, printAfterBootout: 1000}
 	if err := installAgent(f.run, noSleep, p, "/bin/car", nil, 5*time.Minute, 501, "andy", &bytes.Buffer{}); err == nil {
-		t.Error("外れないのに成功した")
+		t.Error("succeeded although it was not unloaded")
 	}
 }
 
@@ -300,11 +300,11 @@ func TestUninstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(p.plistFile); !os.IsNotExist(err) {
-		t.Error("plist が残っている")
+		t.Error("the plist remains")
 	}
 	// Not registered (and no plist) is fine
 	if err := uninstallAgent((&fakeLaunchctl{}).run, p, 501, &bytes.Buffer{}); err != nil {
-		t.Errorf("未登録の uninstall が失敗した: %v", err)
+		t.Errorf("uninstall of an unregistered job failed: %v", err)
 	}
 }
 
@@ -314,17 +314,17 @@ func TestUninstallKeepsPlistWhenBootoutFails(t *testing.T) {
 	_ = os.WriteFile(p.plistFile, []byte("x"), 0o644)
 	f := &fakeLaunchctl{bootoutErr: errors.New("exit 5: Input/output error"), bootoutOut: "Boot-out failed: 5"}
 	if err := uninstallAgent(f.run, p, 501, &bytes.Buffer{}); err == nil {
-		t.Error("bootout の失敗が error にならなかった")
+		t.Error("a bootout failure did not give an error")
 	}
 	if _, err := os.Stat(p.plistFile); err != nil {
-		t.Error("読み込まれたままなのに plist を消した")
+		t.Error("deleted the plist although the job is still loaded")
 	}
 }
 
 func TestExecRunnerErrorCarriesStderr(t *testing.T) {
 	_, err := execRunner("sh", "-c", "echo boom >&2; exit 3")
 	if err == nil || !strings.Contains(err.Error(), "boom") {
-		t.Errorf("stderr が error に含まれない: %v", err)
+		t.Errorf("stderr is not in the error: %v", err)
 	}
 }
 
@@ -338,13 +338,13 @@ func TestPrintStatus(t *testing.T) {
 	printStatus(run, p, 501, 3, &out)
 	for _, want := range []string{"state=not running", "runs=4", "Last run that finished: 2026-11-07T17:00:00Z", "U-A 3/3 (gave up", "U-B 1/3\n", "U-C 3 (shown in the sidebar", "U-D 1\n"} {
 		if !strings.Contains(out.String(), want) {
-			t.Errorf("status に %q が無い:\n%s", want, out.String())
+			t.Errorf("status lacks %q:\n%s", want, out.String())
 		}
 	}
 	out.Reset()
 	printStatus(func(string, ...string) (string, error) { return "", errors.New("x") }, defaultPaths(t.TempDir()), 501, 3, &out)
 	if !strings.Contains(out.String(), "launchd: not registered") || !strings.Contains(out.String(), "state.json: none") {
-		t.Errorf("未登録・状態なし:\n%s", out.String())
+		t.Errorf("not registered, no state:\n%s", out.String())
 	}
 }
 
@@ -372,14 +372,14 @@ func TestExecute(t *testing.T) {
 	if code, out, _ := run("--version"); code != 0 || !strings.HasPrefix(out, "cmux-agent-restore ") {
 		t.Errorf("--version: %d %q", code, out)
 	}
-	if code, out, _ := run("--help"); code != 0 || !strings.Contains(out, "サブコマンド") {
+	if code, out, _ := run("--help"); code != 0 || !strings.Contains(out, "Subcommands:") {
 		t.Errorf("--help: %d", code)
 	}
 	if code, _, _ := run(); code != 2 {
-		t.Errorf("引数なし: %d", code)
+		t.Errorf("no arguments: %d", code)
 	}
 	if code, _, errOut := run("frobnicate"); code != 2 || !strings.Contains(errOut, "frobnicate") {
-		t.Errorf("不明なサブコマンド: %d %q", code, errOut)
+		t.Errorf("unknown subcommand: %d %q", code, errOut)
 	}
 	for _, bad := range [][]string{
 		{"run", "--batch", "0"}, {"run", "--max-attempts", "0"}, {"run", "--kinds", ","},
@@ -389,8 +389,8 @@ func TestExecute(t *testing.T) {
 			t.Errorf("%v: %d, want 2", bad, code)
 		}
 	}
-	if code, _, errOut := run("run", "--dry-run"); code != 1 || !strings.Contains(errOut, "cmux が見つからない") {
-		t.Errorf("cmux が無い: %d %q", code, errOut)
+	if code, _, errOut := run("run", "--dry-run"); code != 1 || !strings.Contains(errOut, "cmux not found") {
+		t.Errorf("no cmux: %d %q", code, errOut)
 	}
 }
 
@@ -403,14 +403,14 @@ func TestExecuteRunDryRun(t *testing.T) {
 	if code := execute([]string{"run", "--dry-run"}, &o, &e, d); code != 0 {
 		t.Fatalf("code %d: %s", code, e.String())
 	}
-	if !strings.Contains(o.String(), "[dry-run] 対象 1 件（送信 1・戻らない 0）") {
-		t.Errorf("出力:\n%s", o.String())
+	if !strings.Contains(o.String(), "[dry-run] targets 1 (to send 1, given up 0)") {
+		t.Errorf("output:\n%s", o.String())
 	}
 	if _, err := os.Stat(d.paths.logFile); !os.IsNotExist(err) {
-		t.Error("dry-run がログファイルを作った")
+		t.Error("dry-run created a log file")
 	}
 	if len(w.events) != 0 {
-		t.Errorf("dry-run で書いた: %v", w.events)
+		t.Errorf("dry-run wrote: %v", w.events)
 	}
 }
 
@@ -418,7 +418,7 @@ func TestExecuteRunLocked(t *testing.T) {
 	d := testDeps(t)
 	d.lookPath = func(string) (string, error) { return "/fake/cmux", nil }
 	d.run = func(string, ...string) (string, error) {
-		t.Error("ロック中なのに cmux を呼んだ")
+		t.Error("called cmux although locked")
 		return "", nil
 	}
 	release, err := acquireLock(d.paths.lockFile)
@@ -427,7 +427,7 @@ func TestExecuteRunLocked(t *testing.T) {
 	}
 	defer release()
 	var o, e bytes.Buffer
-	if code := execute([]string{"run"}, &o, &e, d); code != 0 || !strings.Contains(o.String(), "別のプロセスが実行中") {
+	if code := execute([]string{"run"}, &o, &e, d); code != 0 || !strings.Contains(o.String(), "another process is running") {
 		t.Errorf("code %d out %q", code, o.String())
 	}
 }
@@ -442,8 +442,8 @@ func TestExecuteRunWritesLog(t *testing.T) {
 		t.Fatalf("code %d: %s", code, e.String())
 	}
 	b, err := os.ReadFile(d.paths.logFile)
-	if err != nil || !strings.Contains(string(b), "送信 surface:1 1/3") {
-		t.Errorf("ログファイル: %v\n%s", err, b)
+	if err != nil || !strings.Contains(string(b), "sent surface:1 1/3") {
+		t.Errorf("log file: %v\n%s", err, b)
 	}
 	if s := loadState(d.paths.stateFile); s.Attempts[tabN(1, "").uuid] != 1 {
 		t.Errorf("state %v", s)
@@ -461,10 +461,10 @@ func TestInstallPassesOnlyExplicitFlags(t *testing.T) {
 	b, _ := os.ReadFile(d.paths.plistFile)
 	s := string(b)
 	if !strings.Contains(s, "<string>--kinds</string>\n        <string>claude</string>") || strings.Contains(s, "--batch") {
-		t.Errorf("plist の引数:\n%s", s)
+		t.Errorf("plist arguments:\n%s", s)
 	}
 	if !strings.Contains(s, "<integer>600</integer>") {
-		t.Errorf("間隔:\n%s", s)
+		t.Errorf("interval:\n%s", s)
 	}
 }
 
@@ -475,7 +475,7 @@ func TestExecRunnerEmptiesNodeOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out != "" {
-		t.Errorf("子プロセスに NODE_OPTIONS が渡った: %q", out)
+		t.Errorf("NODE_OPTIONS reached the child process: %q", out)
 	}
 }
 
@@ -499,9 +499,9 @@ func TestRestoreKindsLimitsConcurrency(t *testing.T) {
 	}
 	restoreKinds(run, "cmux", tabs)
 	if peak.Load() > 4 {
-		t.Errorf("同時に %d 本走った, want 4 以下", peak.Load())
+		t.Errorf("%d ran at once, want 4 or fewer", peak.Load())
 	}
 	if peak.Load() < 2 {
-		t.Errorf("並列になっていない（最大 %d）", peak.Load())
+		t.Errorf("not parallel (max %d)", peak.Load())
 	}
 }

@@ -2,7 +2,7 @@
 
 Re-send `cmux restore` to the Claude Code and Codex tabs that [cmux](https://github.com/manaflow-ai/cmux) failed to bring back.
 
-After you restart cmux, some tabs come back as a bare shell even though cmux still holds a restore record for them. In one restart with cmux 0.65.2, 50 of 208 tabs were left like this. This tool finds those tabs and types `cmux restore --surface <ref>` into their shell, a few at a time, until the agent is back.
+After you restart cmux, some tabs come back as a bare shell even though cmux still holds a restore record for them. In one restart with cmux 0.65.2, 50 of 208 tabs were left like this. This tool finds those tabs and types `cmux restore --surface <surface-uuid>` into their shell, a few at a time, until the agent is back.
 
 macOS only (cmux is macOS only). A single Go binary with no dependencies.
 

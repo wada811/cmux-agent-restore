@@ -14,9 +14,9 @@ import (
 	"time"
 )
 
-// plistXML は launchd の plist を作る。
-// ログは本体が ~/Library/Logs/cmux-agent-restore.log に書くので、標準出力は捨てる
-// （~/Documents 配下は launchd から書けないため、置き場所は ~/Library/Logs）。
+// plistXML builds the launchd plist.
+// The program writes its own log to ~/Library/Logs/cmux-agent-restore.log, so stdout is discarded
+// (launchd cannot write under ~/Documents, hence ~/Library/Logs).
 func plistXML(exe string, runArgs []string, interval time.Duration, home, user string) string {
 	esc := func(s string) string {
 		var b bytes.Buffer
@@ -188,7 +188,7 @@ func uninstallAgent(run Runner, p paths, uid int, stdout io.Writer) error {
 
 var launchctlFieldRe = regexp.MustCompile(`(?m)^\s*(state|runs|last exit code|run interval) = (.+)$`)
 
-// parseLaunchctlPrint は `launchctl print` の出力から state・runs・last exit code・run interval を拾う。
+// parseLaunchctlPrint picks state, runs, last exit code and run interval out of `launchctl print`.
 func parseLaunchctlPrint(out string) map[string]string {
 	fields := map[string]string{}
 	for _, m := range launchctlFieldRe.FindAllStringSubmatch(out, -1) {
