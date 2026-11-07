@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,8 +46,12 @@ func TestParseRestoreKind(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := parseRestoreKind(c.in); got != c.want {
+			got, err := parseRestoreKind(c.in)
+			if got != c.want {
 				t.Errorf("got %q, want %q", got, c.want)
+			}
+			if (err != nil) != (c.in == "oops") {
+				t.Errorf("err = %v（読めない出力のときだけ error にする）", err)
 			}
 		})
 	}
@@ -330,5 +337,32 @@ func TestExecRunnerEmptiesNodeOptions(t *testing.T) {
 	}
 	if out != "" {
 		t.Errorf("子プロセスに NODE_OPTIONS が渡った: %q", out)
+	}
+}
+
+func TestRestoreKindsLimitsConcurrency(t *testing.T) {
+	var tabs []Tab
+	for i := 0; i < 30; i++ {
+		tabs = append(tabs, Tab{UUID: fmt.Sprintf("U%d", i), Ref: fmt.Sprintf("surface:%d", i)})
+	}
+	var cur, peak atomic.Int32
+	var mu sync.Mutex
+	run := func(name string, args ...string) (string, error) {
+		n := cur.Add(1)
+		mu.Lock()
+		if n > peak.Load() {
+			peak.Store(n)
+		}
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		cur.Add(-1)
+		return `{"restore_record":null}`, nil
+	}
+	restoreKinds(run, "cmux", tabs)
+	if peak.Load() > 4 {
+		t.Errorf("同時に %d 本走った, want 4 以下", peak.Load())
+	}
+	if peak.Load() < 2 {
+		t.Errorf("並列になっていない（最大 %d）", peak.Load())
 	}
 }

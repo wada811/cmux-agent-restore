@@ -31,6 +31,8 @@ type world struct {
 	treeCalls  int                   // cmux tree の呼び出し回数
 	onTreeCall func(w *world, n int) // tree を返す直前に呼ぶ（n は 1 から）
 	sendError  map[string]error      // ref → send の失敗
+	recordOut  map[string]string     // surface UUID → resume show の出力の差し替え
+	recordErr  map[string]error      // surface UUID → resume show の失敗
 
 	events []string
 }
@@ -51,7 +53,7 @@ func tabN(i int, ws string) wTab {
 }
 
 func newWorld(tabs ...wTab) *world {
-	w := &world{tabs: tabs, agents: map[string]bool{}, agentCmd: map[string]string{}, ttyEnv: map[string]string{}, ttyPs: map[string]string{}, sendError: map[string]error{}}
+	w := &world{tabs: tabs, agents: map[string]bool{}, agentCmd: map[string]string{}, ttyEnv: map[string]string{}, ttyPs: map[string]string{}, sendError: map[string]error{}, recordOut: map[string]string{}, recordErr: map[string]error{}}
 	for _, t := range tabs {
 		w.ttyPs[t.tty] = "1 Ss+ -/bin/zsh\n"
 	}
@@ -117,6 +119,12 @@ func (w *world) cmux(args []string) (string, error) {
 	case "surface":
 		// --surface には UUID を渡す。ref だと cmux の再起動で別のタブを指すことがある
 		id := args[len(args)-1]
+		if err := w.recordErr[id]; err != nil {
+			return "", err
+		}
+		if out, ok := w.recordOut[id]; ok {
+			return out, nil
+		}
 		for _, t := range w.tabs {
 			if t.uuid == id {
 				w.kindsRead = append(w.kindsRead, t.ref)
@@ -580,7 +588,7 @@ func TestRestoreCountsAttemptEvenWhenSendFails(t *testing.T) {
 	if got := loadState(h.env.StatePath).Attempts[a.uuid]; got != 1 {
 		t.Errorf("送信が失敗しても試行に数える（シェルに打ち込めた可能性があるため）: %d", got)
 	}
-	if !h.logged("WARN 送信 surface:1 失敗") {
+	if !h.logged("WARN 送信 surface:1 failed") {
 		t.Errorf("ログ %v", h.logs)
 	}
 }
@@ -689,5 +697,39 @@ func TestRestoreSkipsWhenTabDisappearedSinceFirstTree(t *testing.T) {
 	}
 	if !h.logged("no longer exists") {
 		t.Errorf("ログ %v", h.logs)
+	}
+}
+
+func TestRestoreKeepsAttemptsWhenRecordCannotBeRead(t *testing.T) {
+	// 記録が「読めなかった」ことと「記録が無い」ことは別。読めなかったタブの試行回数を消すと、
+	// 打ち切ったタブにまた送ってしまう
+	a, b, c := tabN(1, "workspace:1"), tabN(2, "workspace:1"), tabN(3, "workspace:1")
+	w := newWorld(a, b, c)
+	w.recordErr[a.uuid] = errors.New("cmux timed out")
+	w.recordOut[b.uuid] = "not json"
+	h := newHarness(t, w)
+	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{a.uuid: 3, b.uuid: 2, c.uuid: 1}})
+	mustRestore(t, h, defaultOptions())
+	state := loadState(h.env.StatePath)
+	if state.Attempts[a.uuid] != 3 || state.Attempts[b.uuid] != 2 {
+		t.Errorf("読めなかったタブの試行回数が消えた・変わった: %v", state.Attempts)
+	}
+	if got := w.sends(); !slices.Equal(got, []string{"surface:3"}) {
+		t.Errorf("送信先 %v, want [surface:3]（読めなかったタブには送らない）", got)
+	}
+	if !h.logged("could not read the restore record") {
+		t.Errorf("ログ %v", h.logs)
+	}
+}
+
+func TestRestoreCleansAttemptsWhenRecordIsGone(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	a.kind = "" // 記録が無い（読めたうえで null）
+	w := newWorld(a)
+	h := newHarness(t, w)
+	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{a.uuid: 2}})
+	mustRestore(t, h, defaultOptions())
+	if _, ok := loadState(h.env.StatePath).Attempts[a.uuid]; ok {
+		t.Error("記録が無くなったタブの試行回数が残っている")
 	}
 }

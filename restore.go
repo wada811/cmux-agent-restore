@@ -84,7 +84,7 @@ func (e *Env) warn(what string, err error) {
 	if i := strings.Index(msg, "\n"); i >= 0 {
 		msg = msg[:i]
 	}
-	e.Logf("WARN %s 失敗: %s", what, msg)
+	e.Logf("WARN %s failed: %s", what, msg)
 }
 
 // Restore は 1 回見回って、戻し損ねたタブに cmux restore を送る。
@@ -123,10 +123,15 @@ func Restore(env *Env, opt Options) error {
 			candidates = append(candidates, t)
 		}
 	}
-	kindList := restoreKinds(env.Run, env.Cmux, candidates)
+	kindList, readErrs := restoreKinds(env.Run, env.Cmux, candidates)
 	kinds := map[string]string{}
+	unreadable := map[string]bool{}
 	for i, t := range candidates {
 		kinds[t.UUID] = kindList[i]
+		if readErrs[i] != nil {
+			unreadable[t.UUID] = true
+			env.warn("could not read the restore record of "+t.Ref, readErrs[i])
+		}
 	}
 	targets := selectTargets(tabs, withAgent, func(t Tab) string { return kinds[t.UUID] }, opt.Kinds)
 	targetUUIDs := map[string]bool{}
@@ -134,9 +139,10 @@ func Restore(env *Env, opt Options) error {
 		targetUUIDs[t.UUID] = true
 	}
 
-	// 戻った・消えた・記録が無くなったタブは状態から外す
+	// Drop tabs that came back, were closed, or lost their record. A tab whose record could not be read
+	// is kept: we do not know that it is gone, and dropping its count would restart an exhausted tab
 	for uuid := range state.Attempts {
-		if !targetUUIDs[uuid] {
+		if !targetUUIDs[uuid] && !unreadable[uuid] {
 			delete(state.Attempts, uuid)
 		}
 	}
