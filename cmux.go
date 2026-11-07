@@ -130,7 +130,7 @@ func restoreKinds(run Runner, cmux string, tabs []Tab) []string {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			out, err := run(cmux, "surface", "resume", "show", "--json", "--surface", t.Ref)
+			out, err := run(cmux, "surface", "resume", "show", "--json", "--surface", t.UUID)
 			if err != nil {
 				return
 			}

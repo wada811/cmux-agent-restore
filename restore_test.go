@@ -78,6 +78,16 @@ func (w *world) treeJSON() string {
 	return fmt.Sprintf(`{"windows":[{"workspaces":[%s]}]}`, strings.Join(wss, ","))
 }
 
+// refOf は --surface に渡された UUID を ref にする。UUID でなければ「BAD:」を付けて、試験が失敗するようにする。
+func (w *world) refOf(target string) string {
+	for _, t := range w.tabs {
+		if t.uuid == target {
+			return t.ref
+		}
+	}
+	return "BAD:" + target
+}
+
 func (w *world) record(e string) { w.events = append(w.events, e) }
 
 func (w *world) run(name string, args ...string) (string, error) {
@@ -97,10 +107,11 @@ func (w *world) cmux(args []string) (string, error) {
 		}
 		return w.treeJSON(), nil
 	case "surface":
-		ref := args[len(args)-1]
-		w.kindsRead = append(w.kindsRead, ref)
+		// --surface には UUID を渡す。ref だと cmux の再起動で別のタブを指すことがある
+		id := args[len(args)-1]
 		for _, t := range w.tabs {
-			if t.ref == ref {
+			if t.uuid == id {
+				w.kindsRead = append(w.kindsRead, t.ref)
 				if t.kind == "" {
 					return `{"restore_record":null}`, nil
 				}
@@ -109,13 +120,13 @@ func (w *world) cmux(args []string) (string, error) {
 		}
 		return "", errors.New("no such surface")
 	case "send":
-		ref := args[2]
+		ref := w.refOf(args[2])
 		if err := w.sendError[ref]; err != nil {
 			return "", err
 		}
 		w.record("send " + ref + " " + args[3])
 	case "send-key":
-		w.record("send-key " + args[2] + " " + args[3])
+		w.record("send-key " + w.refOf(args[2]) + " " + args[3])
 	case "set-status":
 		w.record("set-status " + args[2] + " " + args[4])
 	case "clear-status":
@@ -252,7 +263,7 @@ func TestRestoreBatches(t *testing.T) {
 	if !slices.Contains(w.events, "send-key surface:1 enter") {
 		t.Errorf("enter を送っていない: %v", w.events)
 	}
-	if !slices.Contains(w.events, "send surface:1 cmux restore --surface surface:1") {
+	if !slices.Contains(w.events, "send surface:1 cmux restore --surface "+tabs[0].uuid) {
 		t.Errorf("復元コマンドが違う: %v", w.events)
 	}
 	state := loadState(h.env.StatePath)

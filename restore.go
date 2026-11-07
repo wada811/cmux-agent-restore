@@ -167,11 +167,11 @@ func Restore(env *Env, opt Options) error {
 			}
 			state.Attempts[t.UUID]++
 			sentInPrevBatch = true
-			if _, err := env.Run(env.Cmux, "send", "--surface", t.Ref, "cmux restore --surface "+t.Ref); err != nil {
+			if _, err := env.Run(env.Cmux, "send", "--surface", t.UUID, "cmux restore --surface "+t.UUID); err != nil {
 				env.warn("送信 "+t.Ref, err)
 				continue
 			}
-			if _, err := env.Run(env.Cmux, "send-key", "--surface", t.Ref, "enter"); err != nil {
+			if _, err := env.Run(env.Cmux, "send-key", "--surface", t.UUID, "enter"); err != nil {
 				env.warn("送信 "+t.Ref, err)
 				continue
 			}
