@@ -321,3 +321,14 @@ func TestInstallPassesOnlyExplicitFlags(t *testing.T) {
 		t.Errorf("間隔:\n%s", s)
 	}
 }
+
+func TestExecRunnerEmptiesNodeOptions(t *testing.T) {
+	t.Setenv("NODE_OPTIONS", "--require /tmp/evil.js")
+	out, err := execRunner("sh", "-c", `printf %s "$NODE_OPTIONS"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "" {
+		t.Errorf("子プロセスに NODE_OPTIONS が渡った: %q", out)
+	}
+}

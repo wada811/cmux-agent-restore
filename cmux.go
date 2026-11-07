@@ -32,8 +32,8 @@ func execRunner(name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	// 起動元（launchd など）が NODE_OPTIONS 等を持っていても cmux に影響させない
-	cmd.Env = os.Environ()
+	// 起動元が持つ Node のフラグ（--require など）を cmux の CLI に引き継がない
+	cmd.Env = append(os.Environ(), "NODE_OPTIONS=")
 	out, err := cmd.Output()
 	return string(out), err
 }
