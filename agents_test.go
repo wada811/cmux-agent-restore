@@ -96,11 +96,6 @@ func TestSelectTargets(t *testing.T) {
 			t.Errorf("got %v", got)
 		}
 	})
-	t.Run("Claude が動いているタブの codex 記録は対象外", func(t *testing.T) {
-		if got := pick([]string{U1}, map[string]string{U1: "codex"}); len(got) != 0 {
-			t.Errorf("got %v", got)
-		}
-	})
 	t.Run("エージェントが動いているタブは、記録の kind が何でも対象外", func(t *testing.T) {
 		if got := pick([]string{U1, U2}, map[string]string{U1: "claude", U2: "codex"}); len(got) != 0 {
 			t.Errorf("got %v", got)

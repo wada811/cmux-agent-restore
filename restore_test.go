@@ -21,12 +21,14 @@ type world struct {
 	psErr     error
 	kindsRead []string // 復元記録を読んだタブの ref
 
-	agents    map[string]bool   // 動いているエージェントがいる surface UUID
-	ttyEnv    map[string]string // tty → ps eww -t の出力
-	ttyPs     map[string]string // tty → ps -t の出力
-	psCalls   int               // ps -axo の呼び出し回数
-	onPsCall  func(w *world, n int)
-	sendError map[string]error // ref → send の失敗
+	agents     map[string]bool   // 動いているエージェントがいる surface UUID
+	agentCmd   map[string]string // surface UUID → エージェントのコマンド行（空なら claude）
+	pidSurface map[string]string // 直近の ps -axo で割り当てた pid → surface UUID
+	ttyEnv     map[string]string // tty → ps eww -t の出力
+	ttyPs      map[string]string // tty → ps -t の出力
+	psCalls    int               // ps -axo の呼び出し回数
+	onPsCall   func(w *world, n int)
+	sendError  map[string]error // ref → send の失敗
 
 	events []string
 }
@@ -47,7 +49,7 @@ func tabN(i int, ws string) wTab {
 }
 
 func newWorld(tabs ...wTab) *world {
-	w := &world{tabs: tabs, agents: map[string]bool{}, ttyEnv: map[string]string{}, ttyPs: map[string]string{}, sendError: map[string]error{}}
+	w := &world{tabs: tabs, agents: map[string]bool{}, agentCmd: map[string]string{}, ttyEnv: map[string]string{}, ttyPs: map[string]string{}, sendError: map[string]error{}}
 	for _, t := range tabs {
 		w.ttyPs[t.tty] = "1 Ss+ -/bin/zsh\n"
 	}
@@ -145,20 +147,28 @@ func (w *world) ps(args []string) (string, error) {
 		if w.onPsCall != nil {
 			w.onPsCall(w, w.psCalls)
 		}
+		// エージェントがいる surface ごとに pid を割り当てる。pid → surface は ps eww -p が引く
+		w.pidSurface = map[string]string{}
 		var lines []string
 		pid := 1000
 		for _, t := range w.tabs {
 			if w.agents[t.uuid] {
 				pid++
-				lines = append(lines, fmt.Sprintf("%d /Users/andy/.local/bin/claude --resume x", pid))
+				w.pidSurface[fmt.Sprint(pid)] = t.uuid
+				cmd := w.agentCmd[t.uuid]
+				if cmd == "" {
+					cmd = "/Users/andy/.local/bin/claude --resume x"
+				}
+				lines = append(lines, fmt.Sprintf("%d %s", pid, cmd))
 			}
 		}
 		return strings.Join(lines, "\n"), nil
 	case args[0] == "eww" && args[1] == "-p":
+		// 渡された pid の行だけを返す（本物の ps と同じ）
 		var lines []string
-		for u := range w.agents {
-			if w.agents[u] {
-				lines = append(lines, "claude CMUX_SURFACE_ID="+u)
+		for _, pid := range strings.Split(args[2], ",") {
+			if u, ok := w.pidSurface[pid]; ok {
+				lines = append(lines, "agent CMUX_SURFACE_ID="+u)
 			}
 		}
 		return strings.Join(lines, "\n"), nil
@@ -578,5 +588,43 @@ func TestRestoreClearsStatusInEveryWorkspace(t *testing.T) {
 		if !slices.Contains(w.events, "clear-status "+ws) {
 			t.Errorf("%s の表示を消していない: %v", ws, w.events)
 		}
+	}
+}
+
+func TestRestoreDoesNotSendToTabRunningCodex(t *testing.T) {
+	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	a.kind = "codex"
+	w := newWorld(a, b)
+	w.agents[a.uuid] = true
+	w.agentCmd[a.uuid] = "/Users/andy/.local/bin/codex resume x"
+	// Codex が前面にいるタブ。記録は codex のまま
+	w.ttyPs[a.tty] = "1 Ss -/bin/zsh\n2 S+ codex\n"
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
+		t.Errorf("送信先 %v, want [surface:2]（Codex が動いているタブには送らない）", got)
+	}
+}
+
+func TestRestoreSkipsWhenAgentAppearsOnlyAtSecondCheck(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	// ps -axo は、最初の一覧（1 回目）→ 送る直前の確認の 1 回目（2 回目）・2 回目（3 回目）の順に呼ばれる。
+	// 3 回目で初めてエージェントが見える
+	w.onPsCall = func(w *world, n int) {
+		if n == 3 {
+			w.agents[a.uuid] = true
+		}
+	}
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if len(w.sends()) != 0 {
+		t.Errorf("2 回目の確認で見えたのに送った: %v", w.sends())
+	}
+	if !h.logged("エージェントが起動済み") {
+		t.Errorf("ログ %v", h.logs)
+	}
+	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
+		t.Errorf("試行回数 %d, want 0", n)
 	}
 }
