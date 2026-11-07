@@ -234,3 +234,23 @@ func foregroundOnTty(run Runner, tty, surfaceID string) Foreground {
 }
 
 var errNoCmux = errors.New("cmux が見つからない")
+
+// sharedTTYs returns the ttys that two or more tabs claim in the tree.
+// A tab's tty in `cmux tree` can be stale and point at another tab's terminal. Login and shell
+// processes do not carry CMUX_SURFACE_ID, so ps alone cannot tell; tabs that share a tty cannot be
+// told apart either, and neither is safe to type into.
+func sharedTTYs(tabs []Tab) map[string]bool {
+	count := map[string]int{}
+	for _, t := range tabs {
+		if t.TTY != "" {
+			count[t.TTY]++
+		}
+	}
+	shared := map[string]bool{}
+	for tty, n := range count {
+		if n > 1 {
+			shared[tty] = true
+		}
+	}
+	return shared
+}

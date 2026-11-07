@@ -52,6 +52,32 @@ func (e *Env) listTerminalTabs() (workspaceRefs []string, tabs []Tab, ok bool) {
 	return refs, tabs, true
 }
 
+// recheckTab reads the tree again and returns the tab as it is now. The reason is non-empty when the
+// tab must not be sent to: the tree cannot be read, the tab is gone, its tty differs from the first
+// read, or another tab claims the same tty.
+func (e *Env) recheckTab(t Tab) (Tab, string) {
+	_, tabs, ok := e.listTerminalTabs()
+	if !ok {
+		return Tab{}, "cannot re-read the tab list"
+	}
+	var fresh *Tab
+	for i := range tabs {
+		if tabs[i].UUID == t.UUID {
+			fresh = &tabs[i]
+			break
+		}
+	}
+	switch {
+	case fresh == nil:
+		return Tab{}, "tab no longer exists"
+	case fresh.TTY != t.TTY:
+		return Tab{}, "tty changed since the first read (" + t.TTY + " -> " + fresh.TTY + ")"
+	case sharedTTYs(tabs)[fresh.TTY]:
+		return Tab{}, "other tabs share a tty with this tab (" + fresh.TTY + ")"
+	}
+	return *fresh, ""
+}
+
 // warn は失敗を WARN として記録する。
 func (e *Env) warn(what string, err error) {
 	msg := err.Error()
@@ -157,7 +183,13 @@ func Restore(env *Env, opt Options) error {
 				}
 				continue
 			}
-			if fg := foregroundOnTty(env.Run, t.TTY, t.UUID); fg != FgShell {
+			// Re-read the tree right before sending: a tty from the first read can be stale
+			fresh, reason := env.recheckTab(t)
+			if reason != "" {
+				env.Logf("skip %s %s", t.Ref, reason)
+				continue
+			}
+			if fg := foregroundOnTty(env.Run, fresh.TTY, t.UUID); fg != FgShell {
 				env.Logf("スキップ %s 前面がシェルだけと確かめられない（%s）", t.Ref, fg)
 				continue
 			}

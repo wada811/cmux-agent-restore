@@ -28,7 +28,9 @@ type world struct {
 	ttyPs      map[string]string // tty → ps -t の出力
 	psCalls    int               // ps -axo の呼び出し回数
 	onPsCall   func(w *world, n int)
-	sendError  map[string]error // ref → send の失敗
+	treeCalls  int                   // cmux tree の呼び出し回数
+	onTreeCall func(w *world, n int) // tree を返す直前に呼ぶ（n は 1 から）
+	sendError  map[string]error      // ref → send の失敗
 
 	events []string
 }
@@ -104,6 +106,10 @@ func (w *world) run(name string, args ...string) (string, error) {
 func (w *world) cmux(args []string) (string, error) {
 	switch args[0] {
 	case "tree":
+		w.treeCalls++
+		if w.onTreeCall != nil {
+			w.onTreeCall(w, w.treeCalls)
+		}
 		if w.treeErr != nil {
 			return "", w.treeErr
 		}
@@ -626,5 +632,62 @@ func TestRestoreSkipsWhenAgentAppearsOnlyAtSecondCheck(t *testing.T) {
 	}
 	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
 		t.Errorf("試行回数 %d, want 0", n)
+	}
+}
+
+func TestRestoreSkipsTabsSharingATty(t *testing.T) {
+	// ログイン・zsh の行には CMUX_SURFACE_ID が出ないので、別のタブの古い tty は ps だけでは見分けられない。
+	// tree の中で同じ tty を 2 つ以上のタブが名乗っていたら、どちらが本物か分からないので送らない
+	a, b, c := tabN(1, "workspace:1"), tabN(2, "workspace:1"), tabN(3, "workspace:1")
+	b.tty = a.tty
+	w := newWorld(a, b, c)
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if got := w.sends(); !slices.Equal(got, []string{"surface:3"}) {
+		t.Errorf("送信先 %v, want [surface:3]", got)
+	}
+	if !h.logged("share a tty") {
+		t.Errorf("ログ %v", h.logs)
+	}
+	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
+		t.Errorf("送っていないタブの試行回数 %d, want 0", n)
+	}
+}
+
+func TestRestoreSkipsWhenTtyChangedSinceFirstTree(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	// 1 回目の tree の後（送る直前の取り直し）で tty が変わる
+	w.onTreeCall = func(w *world, n int) {
+		if n >= 2 {
+			w.tabs[0].tty = "ttys999"
+			w.ttyPs["ttys999"] = "1 Ss+ -/bin/zsh\n"
+		}
+	}
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if len(w.sends()) != 0 {
+		t.Errorf("tty が変わったのに送った: %v", w.sends())
+	}
+	if !h.logged("tty changed since") {
+		t.Errorf("ログ %v", h.logs)
+	}
+}
+
+func TestRestoreSkipsWhenTabDisappearedSinceFirstTree(t *testing.T) {
+	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	w := newWorld(a, b)
+	w.onTreeCall = func(w *world, n int) {
+		if n == 2 {
+			w.tabs = w.tabs[1:] // surface:1 が閉じられた
+		}
+	}
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if got := w.sends(); !slices.Equal(got, []string{"surface:2"}) {
+		t.Errorf("送信先 %v, want [surface:2]", got)
+	}
+	if !h.logged("no longer exists") {
+		t.Errorf("ログ %v", h.logs)
 	}
 }
