@@ -13,6 +13,8 @@ const (
 	defaultMaxAttempts   = 3
 	presenceInterval     = 1500 * time.Millisecond
 	statusKey            = "agent_restore"
+	// unknownLimit is how many runs in a row a tab may stay unverifiable before it is shown in the sidebar.
+	unknownLimit = 3
 )
 
 // Options は run のフラグ。
@@ -54,28 +56,29 @@ func (e *Env) listTerminalTabs() (workspaceRefs []string, tabs []Tab, ok bool) {
 
 // recheckTab reads the tree again and returns the tab as it is now. The reason is non-empty when the
 // tab must not be sent to: the tree cannot be read, the tab is gone, its tty differs from the first
-// read, or another tab claims the same tty.
-func (e *Env) recheckTab(t Tab) (Tab, string) {
+// read, or another tab claims the same tty. unverifiable is true for the last two: the tab is there
+// but we cannot tell which terminal it owns.
+func (e *Env) recheckTab(t Tab) (fresh Tab, reason string, unverifiable bool) {
 	_, tabs, ok := e.listTerminalTabs()
 	if !ok {
-		return Tab{}, "cannot re-read the tab list"
+		return Tab{}, "cannot re-read the tab list", false
 	}
-	var fresh *Tab
+	var cur *Tab
 	for i := range tabs {
 		if tabs[i].UUID == t.UUID {
-			fresh = &tabs[i]
+			cur = &tabs[i]
 			break
 		}
 	}
 	switch {
-	case fresh == nil:
-		return Tab{}, "tab no longer exists"
-	case fresh.TTY != t.TTY:
-		return Tab{}, "tty changed since the first read (" + t.TTY + " -> " + fresh.TTY + ")"
-	case sharedTTYs(tabs)[fresh.TTY]:
-		return Tab{}, "other tabs share a tty with this tab (" + fresh.TTY + ")"
+	case cur == nil:
+		return Tab{}, "tab no longer exists", false
+	case cur.TTY != t.TTY:
+		return Tab{}, "tty changed since the first read (" + t.TTY + " -> " + cur.TTY + ")", true
+	case sharedTTYs(tabs)[cur.TTY]:
+		return Tab{}, "other tabs share a tty with this tab (" + cur.TTY + ")", true
 	}
-	return *fresh, ""
+	return *cur, "", false
 }
 
 // warn は失敗を WARN として記録する。
@@ -148,11 +151,19 @@ func Restore(env *Env, opt Options) error {
 	}
 
 	var stuck, toSend []Tab
+	sendable := map[string]bool{}
 	for _, t := range targets {
 		if state.Attempts[t.UUID] >= opt.MaxAttempts {
 			stuck = append(stuck, t)
 		} else {
 			toSend = append(toSend, t)
+			sendable[t.UUID] = true
+		}
+	}
+	// The streak only means something for tabs we still try to send to
+	for uuid := range state.UnknownStreak {
+		if !sendable[uuid] && !unreadable[uuid] {
+			delete(state.UnknownStreak, uuid)
 		}
 	}
 	env.Logf("対象 %d 件（送信 %d・戻らない %d）", len(targets), len(toSend), len(stuck))
@@ -184,21 +195,31 @@ func Restore(env *Env, opt Options) error {
 				if presence == Present {
 					env.Logf("スキップ %s エージェントが起動済み", t.Ref)
 					delete(state.Attempts, t.UUID)
+					delete(state.UnknownStreak, t.UUID)
 				} else {
 					env.Logf("スキップ %s エージェントの有無を判定できない", t.Ref)
 				}
 				continue
 			}
 			// Re-read the tree right before sending: a tty from the first read can be stale
-			fresh, reason := env.recheckTab(t)
+			fresh, reason, unverifiable := env.recheckTab(t)
 			if reason != "" {
 				env.Logf("skip %s %s", t.Ref, reason)
+				if unverifiable {
+					state.UnknownStreak[t.UUID]++
+				}
 				continue
 			}
 			if fg := foregroundOnTty(env.Run, fresh.TTY, t.UUID); fg != FgShell {
 				env.Logf("スキップ %s 前面がシェルだけと確かめられない（%s）", t.Ref, fg)
+				if fg == FgUnknown {
+					state.UnknownStreak[t.UUID]++
+				} else {
+					delete(state.UnknownStreak, t.UUID)
+				}
 				continue
 			}
+			delete(state.UnknownStreak, t.UUID)
 			if opt.DryRun {
 				env.Logf("再確認 %s エージェントがいない・前面はシェル（dry-run のため送らない）", t.Ref)
 				continue
@@ -223,14 +244,33 @@ func Restore(env *Env, opt Options) error {
 		return nil
 	}
 
-	// 戻らないタブがある workspace にだけ表示を出し、それ以外の workspace からは消す
+	// Show a status only in workspaces that have a tab a person must look at, and clear it elsewhere.
+	// Two kinds, told apart in the text: tabs we gave up on (restore by hand), and tabs we could not
+	// verify for unknownLimit runs in a row (check by hand).
 	stuckByWs := map[string]int{}
 	for _, t := range stuck {
 		stuckByWs[t.WorkspaceRef]++
 	}
+	unverifiableByWs := map[string]int{}
+	for _, t := range toSend {
+		if state.UnknownStreak[t.UUID] >= unknownLimit {
+			unverifiableByWs[t.WorkspaceRef]++
+		}
+	}
 	for _, ws := range workspaceRefs {
+		var parts []string
 		if n := stuckByWs[ws]; n > 0 {
-			if _, err := env.Run(env.Cmux, "set-status", statusKey, fmt.Sprintf("Needs restore %d", n),
+			parts = append(parts, fmt.Sprintf("Needs restore %d", n))
+		}
+		if n := unverifiableByWs[ws]; n > 0 {
+			parts = append(parts, fmt.Sprintf("cannot verify %d", n))
+		}
+		if len(parts) > 0 {
+			text := strings.Join(parts, ", ")
+			if stuckByWs[ws] == 0 {
+				text = "Cannot verify " + fmt.Sprint(unverifiableByWs[ws])
+			}
+			if _, err := env.Run(env.Cmux, "set-status", statusKey, text,
 				"--workspace", ws, "--icon", "exclamationmark.triangle.fill", "--color", "#E5484D"); err != nil {
 				env.warn("set-status "+ws, err)
 			}

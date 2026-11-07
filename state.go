@@ -40,6 +40,9 @@ type State struct {
 	// Attempts は surface UUID → 復元コマンドを送った回数。
 	// エージェントが戻る・タブが消える・記録が無くなると外す。
 	Attempts map[string]int `json:"attempts"`
+	// UnknownStreak is surface UUID -> how many runs in a row we could not confirm that the tab is
+	// safe to type into (unknown foreground, stale or shared tty). Dropped as soon as it is confirmed.
+	UnknownStreak map[string]int `json:"unknown_streak,omitempty"`
 	// LastRun は最後に（dry-run でなく）実行した日時（RFC 3339）。
 	LastRun string `json:"last_run,omitempty"`
 }
@@ -48,7 +51,7 @@ type State struct {
 func loadState(path string) State {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return State{Attempts: map[string]int{}}
+		return State{Attempts: map[string]int{}, UnknownStreak: map[string]int{}}
 	}
 	var s State
 	if json.Unmarshal(b, &s) != nil {
@@ -56,6 +59,9 @@ func loadState(path string) State {
 	}
 	if s.Attempts == nil {
 		s.Attempts = map[string]int{}
+	}
+	if s.UnknownStreak == nil {
+		s.UnknownStreak = map[string]int{}
 	}
 	return s
 }

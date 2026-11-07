@@ -733,3 +733,68 @@ func TestRestoreCleansAttemptsWhenRecordIsGone(t *testing.T) {
 		t.Error("記録が無くなったタブの試行回数が残っている")
 	}
 }
+
+func TestRestoreShowsTabsThatStayUnverifiable(t *testing.T) {
+	// 前面を確かめられない（tty が分からない）タブには送らない。それが続いても人が気づけるよう、
+	// 3 回続いたらサイドバーに出す。手で戻すタブ（Needs restore）とは文面を分ける
+	a := tabN(1, "workspace:1")
+	a.tty = ""
+	w := newWorld(a)
+	h := newHarness(t, w)
+	for run := 1; run <= 3; run++ {
+		w.events = nil
+		mustRestore(t, h, defaultOptions())
+		state := loadState(h.env.StatePath)
+		if state.UnknownStreak[a.uuid] != run {
+			t.Fatalf("run %d: unknown_streak = %v", run, state.UnknownStreak)
+		}
+		shown := slices.Contains(w.events, "set-status Cannot verify 1 workspace:1")
+		if shown != (run == 3) {
+			t.Errorf("run %d: サイドバーの表示 = %v, events = %v", run, shown, w.events)
+		}
+	}
+	if len(w.sends()) != 0 {
+		t.Errorf("確かめられないタブに送った: %v", w.sends())
+	}
+	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 0 {
+		t.Errorf("試行回数 %d, want 0", n)
+	}
+}
+
+func TestRestoreResetsUnverifiableCountWhenForegroundIsKnown(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	h := newHarness(t, w)
+	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{}, UnknownStreak: map[string]int{a.uuid: 2}})
+	mustRestore(t, h, defaultOptions()) // 前面はシェルで確かめられ、送る
+	if _, ok := loadState(h.env.StatePath).UnknownStreak[a.uuid]; ok {
+		t.Error("確かめられたタブの連続回数が残っている")
+	}
+}
+
+func TestRestoreCountsSharedTtyAsUnverifiable(t *testing.T) {
+	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	b.tty = a.tty
+	w := newWorld(a, b)
+	h := newHarness(t, w)
+	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{}, UnknownStreak: map[string]int{a.uuid: 2, b.uuid: 2}})
+	mustRestore(t, h, defaultOptions())
+	if !slices.Contains(w.events, "set-status Cannot verify 2 workspace:1") {
+		t.Errorf("events = %v", w.events)
+	}
+}
+
+func TestRestoreSidebarSeparatesStuckFromUnverifiable(t *testing.T) {
+	stuck, unknown := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	unknown.tty = ""
+	w := newWorld(stuck, unknown)
+	h := newHarness(t, w)
+	_ = saveState(h.env.StatePath, State{
+		Attempts:      map[string]int{stuck.uuid: 3},
+		UnknownStreak: map[string]int{unknown.uuid: 2},
+	})
+	mustRestore(t, h, defaultOptions())
+	if !slices.Contains(w.events, "set-status Needs restore 1, cannot verify 1 workspace:1") {
+		t.Errorf("events = %v", w.events)
+	}
+}
