@@ -113,7 +113,9 @@ func parseSurfaceIDs(psEwwOutput string) map[string]bool {
 // 持つ surface UUID（大文字）の集合を返す。ps 自体が失敗したら error。
 func surfacesWithAgent(run Runner) (map[string]bool, error) {
 	out, err := run("ps", "-axo", "pid=,command=")
-	if err != nil && out == "" {
+	if err != nil {
+		// 一覧が欠けているかもしれないので、出力があっても失敗にする。
+		// 「いない」と誤って判定すると、動いているエージェントのタブに送ってしまう
 		return nil, err
 	}
 	procs := parseAgentProcesses(out)

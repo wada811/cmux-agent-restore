@@ -292,6 +292,14 @@ func TestSurfacesWithAgent(t *testing.T) {
 			t.Errorf("got %v, %v", got, err)
 		}
 	})
+	t.Run("最初の ps が出力つきで失敗しても error（一覧が欠けているかもしれない）", func(t *testing.T) {
+		run := func(name string, args ...string) (string, error) {
+			return "202 /Users/andy/.local/bin/claude\n", errors.New("exit 1")
+		}
+		if _, err := surfacesWithAgent(run); err == nil {
+			t.Error("error にならなかった")
+		}
+	})
 	t.Run("ps が失敗したら error", func(t *testing.T) {
 		run := func(string, ...string) (string, error) { return "", errors.New("boom") }
 		if _, err := surfacesWithAgent(run); err == nil {
