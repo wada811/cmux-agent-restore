@@ -11,6 +11,8 @@ const (
 	defaultBatch         = 3
 	defaultBatchInterval = 20 * time.Second
 	defaultMaxAttempts   = 3
+	defaultRetryInterval = 10 * time.Second
+	defaultMaxRuntime    = 4 * time.Minute
 	presenceInterval     = 1500 * time.Millisecond
 	statusKey            = "agent_restore"
 	// unknownLimit is how many runs in a row a tab may stay unverifiable before it is shown in the sidebar.
@@ -24,10 +26,14 @@ type Options struct {
 	BatchInterval time.Duration
 	MaxAttempts   int
 	Kinds         []string
+	// RetryInterval is the wait before tabs skipped in this run are checked again. 0 turns retrying off.
+	RetryInterval time.Duration
+	// MaxRuntime caps one run, so it ends before the next launchd run starts.
+	MaxRuntime time.Duration
 }
 
 func defaultOptions() Options {
-	return Options{Batch: defaultBatch, BatchInterval: defaultBatchInterval, MaxAttempts: defaultMaxAttempts, Kinds: DefaultKinds}
+	return Options{Batch: defaultBatch, BatchInterval: defaultBatchInterval, MaxAttempts: defaultMaxAttempts, Kinds: DefaultKinds, RetryInterval: defaultRetryInterval, MaxRuntime: defaultMaxRuntime}
 }
 
 // Env is how run reaches the outside. Tests replace it.
@@ -101,6 +107,9 @@ func (e *Env) warn(what string, err error) {
 //     the tab still exists with the same tty.
 //     Tabs with an agent, tabs we cannot decide on, and tabs whose foreground is not a shell are skipped
 //     for this run and do not count as an attempt.
+//   - Tabs skipped for any of those reasons (except an agent already running) are checked again in the same
+//     run, RetryInterval later, with the same checks, until they pass or the run reaches MaxRuntime.
+//     Whatever is left then waits for the next run. UnknownStreak grows at most once per run per tab.
 //   - Restoring everything at once has hit pool_saturated, so send Batch tabs at a time, BatchInterval apart.
 //   - Kinds of failure are not told apart. A tab that has not come back after MaxAttempts sends is not sent
 //     to any more (to stop typing the same command into a shell). It is only shown in the sidebar of its
@@ -182,63 +191,125 @@ func Restore(env *Env, opt Options) error {
 	}
 
 	probe := func() (map[string]bool, error) { return surfacesWithAgent(env.Run) }
+	deadline := env.Now().Add(opt.MaxRuntime)
+	streakBumped := map[string]bool{} // UnknownStreak grows at most once per run, however often a tab is retried
+	bumpStreak := func(uuid string) {
+		if !streakBumped[uuid] {
+			streakBumped[uuid] = true
+			state.UnknownStreak[uuid]++
+		}
+	}
+	// attempt runs the checks for one tab and sends if they all pass. retry is true when the tab was
+	// skipped for a reason that can pass later (cmux has just restarted and ttys are still being assigned).
+	// sent is true when a command was typed into the tab.
+	attempt := func(t Tab) (retry, sent bool) {
+		presence := checkAgentOnSurface(t.UUID, probe, env.Sleep, env.PresenceInterval)
+		if presence != Absent {
+			if presence == Present {
+				env.Logf("skip %s agent already running", t.Ref)
+				delete(state.Attempts, t.UUID)
+				delete(state.UnknownStreak, t.UUID)
+				return false, false
+			}
+			env.Logf("skip %s cannot tell whether an agent is running", t.Ref)
+			return true, false
+		}
+		// Re-read the tree right before sending: a tty from the first read can be stale
+		fresh, reason, unverifiable := env.recheckTab(t)
+		if reason != "" {
+			env.Logf("skip %s %s", t.Ref, reason)
+			if unverifiable {
+				bumpStreak(t.UUID)
+			}
+			return true, false
+		}
+		if fg := foregroundOnTty(env.Run, fresh.TTY, t.UUID); fg != FgShell {
+			env.Logf("skip %s cannot confirm only a shell is in the foreground (%s)", t.Ref, fg)
+			if fg == FgUnknown {
+				bumpStreak(t.UUID)
+			} else {
+				delete(state.UnknownStreak, t.UUID)
+			}
+			return true, false
+		}
+		delete(state.UnknownStreak, t.UUID)
+		if opt.DryRun {
+			env.Logf("recheck %s no agent, shell in the foreground (dry-run, not sending)", t.Ref)
+			return false, false
+		}
+		state.Attempts[t.UUID]++
+		if _, err := env.Run(env.Cmux, "send", "--surface", t.UUID, "cmux restore --surface "+t.UUID); err != nil {
+			env.warn("send "+t.Ref, err)
+			return false, true
+		}
+		if _, err := env.Run(env.Cmux, "send-key", "--surface", t.UUID, "enter"); err != nil {
+			env.warn("send "+t.Ref, err)
+			return false, true
+		}
+		env.Logf("sent %s %d/%d", t.Ref, state.Attempts[t.UUID], opt.MaxAttempts)
+		return false, true
+	}
+
+	// Round 0 goes through every tab. Tabs skipped for a reason that can pass later are tried again in
+	// the next round, after RetryInterval, until none are left or the run reaches MaxRuntime.
+	pending := toSend
 	sentInPrevBatch := false
-	for i := 0; i < len(toSend); i += opt.Batch {
-		// Do not wait after a batch that sent nothing (agents had already started). The pause that avoids pool_saturated is only needed after sending
-		if sentInPrevBatch && !opt.DryRun {
-			env.Sleep(opt.BatchInterval)
+	timedOut := false
+	for round := 0; len(pending) > 0 && !timedOut; round++ {
+		if round > 0 {
+			// The pause that avoids pool_saturated also covers the retry wait
+			wait := opt.RetryInterval
+			if sentInPrevBatch {
+				wait = max(wait, opt.BatchInterval)
+				sentInPrevBatch = false
+			}
+			if env.Now().Add(wait + env.PresenceInterval).After(deadline) {
+				timedOut = true
+				break
+			}
+			env.Sleep(wait)
+			env.Logf("retry %d: %d tabs skipped earlier in this run", round, len(pending))
 		}
-		sentInPrevBatch = false
-		end := min(i+opt.Batch, len(toSend))
-		for _, t := range toSend[i:end] {
-			presence := checkAgentOnSurface(t.UUID, probe, env.Sleep, env.PresenceInterval)
-			if presence != Absent {
-				if presence == Present {
-					env.Logf("skip %s agent already running", t.Ref)
-					delete(state.Attempts, t.UUID)
-					delete(state.UnknownStreak, t.UUID)
-				} else {
-					env.Logf("skip %s cannot tell whether an agent is running", t.Ref)
+		var retryList []Tab
+		for i := 0; i < len(pending) && !timedOut; i += opt.Batch {
+			// Do not wait after a batch that sent nothing (agents had already started). The pause that avoids pool_saturated is only needed after sending
+			if sentInPrevBatch && !opt.DryRun {
+				if env.Now().Add(opt.BatchInterval + env.PresenceInterval).After(deadline) {
+					timedOut = true
+					retryList = append(retryList, pending[i:]...)
+					break
 				}
-				continue
+				env.Sleep(opt.BatchInterval)
 			}
-			// Re-read the tree right before sending: a tty from the first read can be stale
-			fresh, reason, unverifiable := env.recheckTab(t)
-			if reason != "" {
-				env.Logf("skip %s %s", t.Ref, reason)
-				if unverifiable {
-					state.UnknownStreak[t.UUID]++
+			sentInPrevBatch = false
+			end := min(i+opt.Batch, len(pending))
+			for j, t := range pending[i:end] {
+				if !env.Now().Before(deadline) {
+					timedOut = true
+					retryList = append(retryList, pending[i+j:]...)
+					break
 				}
-				continue
-			}
-			if fg := foregroundOnTty(env.Run, fresh.TTY, t.UUID); fg != FgShell {
-				env.Logf("skip %s cannot confirm only a shell is in the foreground (%s)", t.Ref, fg)
-				if fg == FgUnknown {
-					state.UnknownStreak[t.UUID]++
-				} else {
-					delete(state.UnknownStreak, t.UUID)
+				retry, sent := attempt(t)
+				if sent {
+					sentInPrevBatch = true
 				}
-				continue
+				if retry {
+					retryList = append(retryList, t)
+				}
 			}
-			delete(state.UnknownStreak, t.UUID)
-			if opt.DryRun {
-				env.Logf("recheck %s no agent, shell in the foreground (dry-run, not sending)", t.Ref)
-				continue
-			}
-			state.Attempts[t.UUID]++
-			sentInPrevBatch = true
-			if _, err := env.Run(env.Cmux, "send", "--surface", t.UUID, "cmux restore --surface "+t.UUID); err != nil {
-				env.warn("send "+t.Ref, err)
-				continue
-			}
-			if _, err := env.Run(env.Cmux, "send-key", "--surface", t.UUID, "enter"); err != nil {
-				env.warn("send "+t.Ref, err)
-				continue
-			}
-			env.Logf("sent %s %d/%d", t.Ref, state.Attempts[t.UUID], opt.MaxAttempts)
+			// Save after every batch so the attempt counts survive being stopped by a timeout
+			save()
 		}
-		// Save after every batch so the attempt counts survive being stopped by a timeout
-		save()
+		if opt.RetryInterval <= 0 {
+			// Retrying is off
+			pending = nil
+			break
+		}
+		// Tabs that were never looked at in this round are in retryList too
+		pending = retryList
+	}
+	if timedOut && len(pending) > 0 {
+		env.Logf("time limit %s reached, %d tabs left for the next run", opt.MaxRuntime, len(pending))
 	}
 
 	if opt.DryRun {

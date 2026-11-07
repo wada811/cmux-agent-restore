@@ -35,6 +35,8 @@ Flags for `run` (`install` bakes the ones you pass into the plist):
 | `--batch N` | 3 | Tabs per batch. |
 | `--batch-interval DUR` | 20s | Pause between batches (cmux hit `pool_saturated` when everything was restored at once). |
 | `--max-attempts N` | 3 | Stop sending to a tab after this many tries. |
+| `--retry-interval DUR` | 10s | Wait before tabs skipped in this run are checked again. `0` turns retrying off. |
+| `--max-runtime DUR` | 4m | Longest time one run may take (shorter than the 5m launchd interval). Tabs still waiting are left for the next run. |
 | `--kinds LIST` | `claude,codex` | `restore_record` kinds to restore. |
 
 There is no config file. Pass flags instead.
@@ -47,7 +49,7 @@ A tab receives `cmux restore` only if all of these hold:
 2. No agent runs in the tab. Agents are found with `ps` by executable name (`claude`, `codex`) and matched to tabs through the `CMUX_SURFACE_ID` variable of each process. The check is repeated right before sending, 1.5 seconds apart, and both checks must find nothing.
 3. The foreground processes on the tab's tty are only shells (zsh, bash, sh, dash, fish), and that tty does not belong to another tab. This keeps the command out of editors, and out of a running Codex that would take it as a prompt.
 
-A tab that fails check 2 or 3 right before sending is skipped and the attempt is not counted. After `--max-attempts` sends that did not bring the agent back, the tool stops sending to the tab and shows `Needs restore N` in the sidebar status of its workspace (`agent_restore`); restore it by hand. The status is re-evaluated for every workspace on each run.
+A tab that fails check 2 or 3 right before sending is skipped and the attempt is not counted. Right after cmux restarts, ttys are still being reassigned, so many tabs fail for a short while. A skipped tab (except one where an agent is already running) is therefore checked again in the same run, `--retry-interval` later, with exactly the same checks, until it passes or the run reaches `--max-runtime`. The "cannot verify" streak grows by at most 1 per run, however often a tab is retried. Retries are logged as `retry N: M tabs skipped earlier in this run`, and a run cut short logs `time limit ... reached, N tabs left for the next run`. After `--max-attempts` sends that did not bring the agent back, the tool stops sending to the tab and shows `Needs restore N` in the sidebar status of its workspace (`agent_restore`); restore it by hand. The status is re-evaluated for every workspace on each run.
 
 ## Files
 

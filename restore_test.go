@@ -213,15 +213,17 @@ type harness struct {
 	env    *Env
 	logs   []string
 	sleeps []time.Duration
+	now    time.Time // advanced by Sleep, so that the time limit of a run can be tested
 }
 
 func newHarness(t *testing.T, w *world) *harness {
-	h := &harness{w: w}
+	h := &harness{w: w, now: time.Date(2026, 11, 7, 17, 0, 0, 0, time.UTC)}
 	h.env = &Env{
 		Run:  w.run,
 		Cmux: "/fake/cmux",
 		Sleep: func(d time.Duration) {
 			h.sleeps = append(h.sleeps, d)
+			h.now = h.now.Add(d)
 			// Record only the batch pauses in events, so their order against the sends can be checked
 			if d == defaultBatchInterval || d == 5*time.Second {
 				w.record(fmt.Sprintf("sleep %s", d))
@@ -229,7 +231,7 @@ func newHarness(t *testing.T, w *world) *harness {
 		},
 		Logf:             func(f string, a ...any) { h.logs = append(h.logs, fmt.Sprintf(f, a...)) },
 		StatePath:        filepath.Join(t.TempDir(), "state.json"),
-		Now:              func() time.Time { return time.Date(2026, 11, 7, 17, 0, 0, 0, time.UTC) },
+		Now:              func() time.Time { return h.now },
 		PresenceInterval: presenceInterval,
 	}
 	return h
@@ -294,7 +296,7 @@ func TestRestoreBatches(t *testing.T) {
 	if state.Attempts[tabs[0].uuid] != 1 || state.Attempts[tabs[6].uuid] != 1 {
 		t.Errorf("attempt counts were not recorded: %v", state.Attempts)
 	}
-	if state.LastCompletedRun != "2026-11-07T17:00:00Z" {
+	if state.LastCompletedRun != h.now.Format(time.RFC3339) {
 		t.Errorf("last_completed_run = %q", state.LastCompletedRun)
 	}
 }
@@ -796,5 +798,131 @@ func TestRestoreSidebarSeparatesStuckFromUnverifiable(t *testing.T) {
 	mustRestore(t, h, defaultOptions())
 	if !slices.Contains(w.events, "set-status Needs restore 1, cannot verify 1 workspace:1") {
 		t.Errorf("events = %v", w.events)
+	}
+}
+
+func TestRestoreRetriesSkippedTabInSameRun(t *testing.T) {
+	// Right after cmux restarts the tty is still being reassigned. The tab passes on a later round
+	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	w := newWorld(a, b)
+	w.ttyPs[a.tty] = "1 Ss -/bin/zsh\n2 S+ vim\n"
+	h := newHarness(t, w)
+	h.env.Sleep = func(d time.Duration) {
+		h.sleeps = append(h.sleeps, d)
+		h.now = h.now.Add(d)
+		if d >= defaultRetryInterval {
+			w.ttyPs[a.tty] = "1 Ss+ -/bin/zsh\n" // settled
+		}
+	}
+	mustRestore(t, h, defaultOptions())
+	if got := w.sends(); !slices.Equal(got, []string{"surface:2", "surface:1"}) {
+		t.Errorf("sent to %v, want surface:2 then surface:1", got)
+	}
+	if !h.logged("retry 1: 1 tabs skipped earlier in this run") {
+		t.Errorf("log %v", h.logs)
+	}
+	if n := loadState(h.env.StatePath).Attempts[a.uuid]; n != 1 {
+		t.Errorf("attempts %d, want 1", n)
+	}
+	// The send of surface:2 in round 0 means the retry waits for the batch interval (it is the longer wait)
+	if h.count(defaultBatchInterval) != 1 || h.count(defaultRetryInterval) != 0 {
+		t.Errorf("sleeps %v", h.sleeps)
+	}
+}
+
+func TestRestoreRetryStillChecksEverything(t *testing.T) {
+	// A retry never relaxes the checks: a tab whose agent starts while it waits is not sent to
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	w.ttyPs[a.tty] = "1 Ss -/bin/zsh\n2 S+ vim\n"
+	h := newHarness(t, w)
+	h.env.Sleep = func(d time.Duration) {
+		h.sleeps = append(h.sleeps, d)
+		h.now = h.now.Add(d)
+		if d == defaultRetryInterval {
+			w.agents[a.uuid] = true
+		}
+	}
+	_ = saveState(h.env.StatePath, State{Attempts: map[string]int{a.uuid: 1}})
+	mustRestore(t, h, defaultOptions())
+	if len(w.sends()) != 0 {
+		t.Errorf("sent: %v", w.sends())
+	}
+	if _, ok := loadState(h.env.StatePath).Attempts[a.uuid]; ok {
+		t.Error("attempts of a tab with a running agent remain")
+	}
+	if h.logged("retry 2") {
+		t.Errorf("an agent already running must not be retried: %v", h.logs)
+	}
+}
+
+func TestRestoreStopsRetryingAtTimeLimit(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	w.ttyPs[a.tty] = "1 Ss -/bin/zsh\n2 S+ vim\n" // never settles
+	h := newHarness(t, w)
+	opt := defaultOptions()
+	opt.RetryInterval = 10 * time.Second
+	opt.MaxRuntime = 35 * time.Second
+	start := h.now
+	mustRestore(t, h, opt)
+	if len(w.sends()) != 0 {
+		t.Errorf("sent: %v", w.sends())
+	}
+	if !h.logged("time limit 35s reached, 1 tabs left for the next run") {
+		t.Errorf("log %v", h.logs)
+	}
+	// Two waits of 10s fit in 35s (a round of checks takes 1.5s, and a wait is not started if it would end past the limit)
+	if h.count(10*time.Second) != 2 {
+		t.Errorf("retry waits = %d, sleeps %v", h.count(10*time.Second), h.sleeps)
+	}
+	if h.now.Sub(start) > opt.MaxRuntime {
+		t.Errorf("run took %s, over the limit", h.now.Sub(start))
+	}
+}
+
+func TestRestoreTimeLimitLeavesLaterTabsUntouched(t *testing.T) {
+	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	w := newWorld(a, b)
+	h := newHarness(t, w)
+	opt := defaultOptions()
+	opt.Batch = 1
+	opt.MaxRuntime = 15 * time.Second // after the first send, the 20s batch pause does not fit
+	mustRestore(t, h, opt)
+	if got := w.sends(); !slices.Equal(got, []string{"surface:1"}) {
+		t.Errorf("sent to %v, want [surface:1]", got)
+	}
+	if n := loadState(h.env.StatePath).Attempts[b.uuid]; n != 0 {
+		t.Errorf("attempts of an untouched tab %d", n)
+	}
+	if !h.logged("time limit 15s reached") {
+		t.Errorf("log %v", h.logs)
+	}
+}
+
+func TestRestoreRetryIntervalZeroTurnsRetryOff(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	w.ttyPs[a.tty] = "1 Ss -/bin/zsh\n2 S+ vim\n"
+	h := newHarness(t, w)
+	opt := defaultOptions()
+	opt.RetryInterval = 0
+	mustRestore(t, h, opt)
+	if h.logged("retry") || h.count(defaultRetryInterval) != 0 {
+		t.Errorf("retried: %v", h.logs)
+	}
+}
+
+func TestRestoreUnknownStreakGrowsOncePerRun(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	a.tty = "" // unverifiable for the whole run, and retried many times
+	w := newWorld(a)
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if h.count(defaultRetryInterval) < 2 {
+		t.Fatalf("the tab was not retried: sleeps %v", h.sleeps)
+	}
+	if got := loadState(h.env.StatePath).UnknownStreak[a.uuid]; got != 1 {
+		t.Errorf("unknown_streak = %d after one run, want 1", got)
 	}
 }

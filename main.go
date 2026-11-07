@@ -67,6 +67,8 @@ type runFlags struct {
 	batch         int
 	batchInterval time.Duration
 	maxAttempts   int
+	retryInterval time.Duration
+	maxRuntime    time.Duration
 	kinds         string
 	interval      time.Duration
 }
@@ -84,6 +86,8 @@ func newFlagSet(name string, withDryRun, withInterval bool) (*flag.FlagSet, *run
 	fs.IntVar(&f.batch, "batch", defaultBatch, "tabs to send to per batch")
 	fs.DurationVar(&f.batchInterval, "batch-interval", defaultBatchInterval, "pause between batches")
 	fs.IntVar(&f.maxAttempts, "max-attempts", defaultMaxAttempts, "sends before giving up on a tab")
+	fs.DurationVar(&f.retryInterval, "retry-interval", defaultRetryInterval, "wait before checking skipped tabs again in the same run (0 turns retrying off)")
+	fs.DurationVar(&f.maxRuntime, "max-runtime", defaultMaxRuntime, "longest time one run may take")
 	fs.StringVar(&f.kinds, "kinds", strings.Join(DefaultKinds, ","), "restore_record kinds to target (comma separated)")
 	return fs, f
 }
@@ -108,10 +112,14 @@ func (f *runFlags) options() (Options, error) {
 		return Options{}, errors.New("--max-attempts must be 1 or more")
 	case f.batchInterval < 0:
 		return Options{}, errors.New("--batch-interval must be 0 or more")
+	case f.retryInterval < 0:
+		return Options{}, errors.New("--retry-interval must be 0 or more")
+	case f.maxRuntime <= 0:
+		return Options{}, errors.New("--max-runtime must be more than 0")
 	case len(kinds) == 0:
 		return Options{}, errors.New("--kinds is empty")
 	}
-	return Options{DryRun: f.dryRun, Batch: f.batch, BatchInterval: f.batchInterval, MaxAttempts: f.maxAttempts, Kinds: kinds}, nil
+	return Options{DryRun: f.dryRun, Batch: f.batch, BatchInterval: f.batchInterval, MaxAttempts: f.maxAttempts, Kinds: kinds, RetryInterval: f.retryInterval, MaxRuntime: f.maxRuntime}, nil
 }
 
 // setRunArgs lists only the flags that were given explicitly, for install to put in the run arguments of the plist.
@@ -119,7 +127,7 @@ func setRunArgs(fs *flag.FlagSet) []string {
 	var args []string
 	fs.Visit(func(fl *flag.Flag) {
 		switch fl.Name {
-		case "batch", "batch-interval", "max-attempts", "kinds":
+		case "batch", "batch-interval", "max-attempts", "retry-interval", "max-runtime", "kinds":
 			args = append(args, "--"+fl.Name, fl.Value.String())
 		}
 	})
