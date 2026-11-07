@@ -1,0 +1,206 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// 既定値。フラグで上書きできる。
+const (
+	defaultBatch         = 3
+	defaultBatchInterval = 20 * time.Second
+	defaultMaxAttempts   = 3
+	presenceInterval     = 1500 * time.Millisecond
+	statusKey            = "agent_restore"
+)
+
+// Options は run のフラグ。
+type Options struct {
+	DryRun        bool
+	Batch         int
+	BatchInterval time.Duration
+	MaxAttempts   int
+	Kinds         []string
+}
+
+func defaultOptions() Options {
+	return Options{Batch: defaultBatch, BatchInterval: defaultBatchInterval, MaxAttempts: defaultMaxAttempts, Kinds: DefaultKinds}
+}
+
+// Env は run が外に出る口。試験では差し替える。
+type Env struct {
+	Run              Runner
+	Cmux             string
+	Sleep            func(time.Duration)
+	Logf             func(format string, args ...any)
+	StatePath        string
+	Now              func() time.Time
+	PresenceInterval time.Duration
+}
+
+// listTerminalTabs は全 workspace の ref と terminal タブの一覧を返す。cmux が応答しなければ ok=false。
+func (e *Env) listTerminalTabs() (workspaceRefs []string, tabs []Tab, ok bool) {
+	out, err := e.Run(e.Cmux, "tree", "--all", "--id-format", "both", "--json")
+	if err != nil {
+		return nil, nil, false
+	}
+	refs, tabs, err := parseTree(out)
+	if err != nil {
+		return nil, nil, false
+	}
+	return refs, tabs, true
+}
+
+// warn は失敗を WARN として記録する。
+func (e *Env) warn(what string, err error) {
+	msg := err.Error()
+	if i := strings.Index(msg, "\n"); i >= 0 {
+		msg = msg[:i]
+	}
+	e.Logf("WARN %s 失敗: %s", what, msg)
+}
+
+// Restore は 1 回見回って、戻し損ねたタブに cmux restore を送る。
+//
+//   - 対象 = 復元記録（restore_record.checkpoint_id）があり、その kind が Kinds に含まれ、
+//     エージェント（種類を問わない）のプロセスがいない terminal タブ。kind が不明・読めないタブは送らない
+//   - エージェントの有無は tty で判定しない（`cmux tree` の tty は古いことがある）。
+//     各 pid の環境変数 CMUX_SURFACE_ID を読み、tree の surface UUID と突き合わせる
+//   - 対象の一覧は最初に 1 回だけ作り、送り終えるまで数分かかる。その間にエージェントが起動する
+//     ので、タブごとに送る直前に checkAgentOnSurface で確かめ直し、いないと確かめられたタブにだけ送る。
+//     加えて、そのタブの前面がシェルだけであること（foregroundOnTty）も確かめる。
+//     いる・判定できない・前面がシェルでないタブはその回は送らず、試行回数にも数えない
+//   - 一斉復元で pool_saturated になった実績があるので、Batch 件ずつ BatchInterval あけて送る
+//   - 失敗の種類は見分けない。MaxAttempts 回送っても戻らないタブは送るのをやめる
+//     （シェルに同じコマンドを打ち込み続けないため）。表示だけ、そのタブのある workspace の
+//     サイドバーに agent_restore として残す。workspace の ref は cmux の再起動で変わるので、
+//     どこに出したかは覚えず、毎回すべての workspace について出す・消すを決め直す
+//   - cmux が応答しなければ何もしない
+func Restore(env *Env, opt Options) error {
+	workspaceRefs, tabs, ok := env.listTerminalTabs()
+	if !ok {
+		return nil
+	}
+
+	withAgent, err := surfacesWithAgent(env.Run)
+	if err != nil {
+		return fmt.Errorf("ps の実行に失敗: %w", err)
+	}
+	state := loadState(env.StatePath)
+
+	// エージェントがいないタブのうち、対象の種類の復元記録があるものが対象。
+	// 記録は、エージェントがいるタブでは読まない
+	var candidates []Tab
+	for _, t := range tabs {
+		if !withAgent[strings.ToUpper(t.UUID)] {
+			candidates = append(candidates, t)
+		}
+	}
+	kindList := restoreKinds(env.Run, env.Cmux, candidates)
+	kinds := map[string]string{}
+	for i, t := range candidates {
+		kinds[t.UUID] = kindList[i]
+	}
+	targets := selectTargets(tabs, withAgent, func(t Tab) string { return kinds[t.UUID] }, opt.Kinds)
+	targetUUIDs := map[string]bool{}
+	for _, t := range targets {
+		targetUUIDs[t.UUID] = true
+	}
+
+	// 戻った・消えた・記録が無くなったタブは状態から外す
+	for uuid := range state.Attempts {
+		if !targetUUIDs[uuid] {
+			delete(state.Attempts, uuid)
+		}
+	}
+
+	var stuck, toSend []Tab
+	for _, t := range targets {
+		if state.Attempts[t.UUID] >= opt.MaxAttempts {
+			stuck = append(stuck, t)
+		} else {
+			toSend = append(toSend, t)
+		}
+	}
+	env.Logf("対象 %d 件（送信 %d・戻らない %d）", len(targets), len(toSend), len(stuck))
+	for _, t := range targets {
+		env.Logf("  %s %s %s 試行 %d/%d", t.Ref, t.UUID, kinds[t.UUID], state.Attempts[t.UUID], opt.MaxAttempts)
+	}
+
+	save := func() {
+		if opt.DryRun {
+			return
+		}
+		if err := saveState(env.StatePath, state); err != nil {
+			env.warn("状態の保存", err)
+		}
+	}
+
+	probe := func() (map[string]bool, error) { return surfacesWithAgent(env.Run) }
+	sentInPrevBatch := false
+	for i := 0; i < len(toSend); i += opt.Batch {
+		// 送っていない組（エージェントが起動済み）の後は待たない。pool_saturated を避ける間隔は送信にだけ要る
+		if sentInPrevBatch && !opt.DryRun {
+			env.Sleep(opt.BatchInterval)
+		}
+		sentInPrevBatch = false
+		end := min(i+opt.Batch, len(toSend))
+		for _, t := range toSend[i:end] {
+			presence := checkAgentOnSurface(t.UUID, probe, env.Sleep, env.PresenceInterval)
+			if presence != Absent {
+				if presence == Present {
+					env.Logf("スキップ %s エージェントが起動済み", t.Ref)
+					delete(state.Attempts, t.UUID)
+				} else {
+					env.Logf("スキップ %s エージェントの有無を判定できない", t.Ref)
+				}
+				continue
+			}
+			if fg := foregroundOnTty(env.Run, t.TTY, t.UUID); fg != FgShell {
+				env.Logf("スキップ %s 前面がシェルだけと確かめられない（%s）", t.Ref, fg)
+				continue
+			}
+			if opt.DryRun {
+				env.Logf("再確認 %s エージェントがいない・前面はシェル（dry-run のため送らない）", t.Ref)
+				continue
+			}
+			state.Attempts[t.UUID]++
+			sentInPrevBatch = true
+			if _, err := env.Run(env.Cmux, "send", "--surface", t.Ref, "cmux restore --surface "+t.Ref); err != nil {
+				env.warn("送信 "+t.Ref, err)
+				continue
+			}
+			if _, err := env.Run(env.Cmux, "send-key", "--surface", t.Ref, "enter"); err != nil {
+				env.warn("送信 "+t.Ref, err)
+				continue
+			}
+			env.Logf("送信 %s %d/%d", t.Ref, state.Attempts[t.UUID], opt.MaxAttempts)
+		}
+		// timeout で止められても試行回数が残るよう、組ごとに書く
+		save()
+	}
+
+	if opt.DryRun {
+		return nil
+	}
+
+	// 戻らないタブがある workspace にだけ表示を出し、それ以外の workspace からは消す
+	stuckByWs := map[string]int{}
+	for _, t := range stuck {
+		stuckByWs[t.WorkspaceRef]++
+	}
+	for _, ws := range workspaceRefs {
+		if n := stuckByWs[ws]; n > 0 {
+			if _, err := env.Run(env.Cmux, "set-status", statusKey, fmt.Sprintf("Needs restore %d", n),
+				"--workspace", ws, "--icon", "exclamationmark.triangle.fill", "--color", "#E5484D"); err != nil {
+				env.warn("set-status "+ws, err)
+			}
+		} else if _, err := env.Run(env.Cmux, "clear-status", statusKey, "--workspace", ws); err != nil {
+			env.warn("clear-status "+ws, err)
+		}
+	}
+	state.LastRun = env.Now().Format(time.RFC3339)
+	save()
+	return nil
+}
