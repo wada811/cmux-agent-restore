@@ -926,3 +926,38 @@ func TestRestoreUnknownStreakGrowsOncePerRun(t *testing.T) {
 		t.Errorf("unknown_streak = %d after one run, want 1", got)
 	}
 }
+
+func TestRestoreDoesNotRetrySharedTtyInSameRun(t *testing.T) {
+	// A tty claimed by several tabs stays that way until cmux reassigns ttys. Retrying it every
+	// RetryInterval only kept the run going until MaxRuntime, every run
+	a, b := tabN(1, "workspace:1"), tabN(2, "workspace:1")
+	b.tty = a.tty
+	w := newWorld(a, b)
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if len(w.sends()) != 0 {
+		t.Errorf("sent: %v", w.sends())
+	}
+	if h.logged("retry") || h.logged("time limit") || h.count(defaultRetryInterval) != 0 {
+		t.Errorf("retried a shared tty: %v", h.logs)
+	}
+	// It still counts as unverifiable, so the sidebar shows it after unknownLimit runs
+	if got := loadState(h.env.StatePath).UnknownStreak[a.uuid]; got != 1 {
+		t.Errorf("unknown_streak = %d, want 1", got)
+	}
+}
+
+func TestRestoreDoesNotRetryTabGoneInSameRun(t *testing.T) {
+	a := tabN(1, "workspace:1")
+	w := newWorld(a)
+	w.onTreeCall = func(w *world, n int) {
+		if n == 2 {
+			w.tabs = nil // closed between the first read and the re-read
+		}
+	}
+	h := newHarness(t, w)
+	mustRestore(t, h, defaultOptions())
+	if h.logged("retry") || h.count(defaultRetryInterval) != 0 {
+		t.Errorf("retried a closed tab: %v", h.logs)
+	}
+}

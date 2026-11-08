@@ -63,11 +63,13 @@ func (e *Env) listTerminalTabs() (workspaceRefs []string, tabs []Tab, ok bool) {
 // recheckTab reads the tree again and returns the tab as it is now. The reason is non-empty when the
 // tab must not be sent to: the tree cannot be read, the tab is gone, its tty differs from the first
 // read, or another tab claims the same tty. unverifiable is true for the last two: the tab is there
-// but we cannot tell which terminal it owns.
-func (e *Env) recheckTab(t Tab) (fresh Tab, reason string, unverifiable bool) {
+// but we cannot tell which terminal it owns. retryable is true when the reason can pass within the
+// same run: a tree that could not be read, or a tty still being reassigned after a restart. A gone tab
+// and a tty claimed by other tabs do not pass within minutes, so they wait for the next run.
+func (e *Env) recheckTab(t Tab) (fresh Tab, reason string, unverifiable, retryable bool) {
 	_, tabs, ok := e.listTerminalTabs()
 	if !ok {
-		return Tab{}, "cannot re-read the tab list", false
+		return Tab{}, "cannot re-read the tab list", false, true
 	}
 	var cur *Tab
 	for i := range tabs {
@@ -78,13 +80,13 @@ func (e *Env) recheckTab(t Tab) (fresh Tab, reason string, unverifiable bool) {
 	}
 	switch {
 	case cur == nil:
-		return Tab{}, "tab no longer exists", false
+		return Tab{}, "tab no longer exists", false, false
 	case cur.TTY != t.TTY:
-		return Tab{}, "tty changed since the first read (" + t.TTY + " -> " + cur.TTY + ")", true
+		return Tab{}, "tty changed since the first read (" + t.TTY + " -> " + cur.TTY + ")", true, true
 	case sharedTTYs(tabs)[cur.TTY]:
-		return Tab{}, "other tabs share a tty with this tab (" + cur.TTY + ")", true
+		return Tab{}, "other tabs share a tty with this tab (" + cur.TTY + ")", true, false
 	}
-	return *cur, "", false
+	return *cur, "", false, false
 }
 
 // warn logs a failure as WARN.
@@ -107,8 +109,10 @@ func (e *Env) warn(what string, err error) {
 //     the tab still exists with the same tty.
 //     Tabs with an agent, tabs we cannot decide on, and tabs whose foreground is not a shell are skipped
 //     for this run and do not count as an attempt.
-//   - Tabs skipped for any of those reasons (except an agent already running) are checked again in the same
-//     run, RetryInterval later, with the same checks, until they pass or the run reaches MaxRuntime.
+//   - Tabs skipped for a reason that can pass within minutes are checked again in the same run,
+//     RetryInterval later, with the same checks, until they pass or the run reaches MaxRuntime. Not retried
+//     in the same run: an agent already running, a tab that is gone, and a tty other tabs also claim (it
+//     stays that way until cmux reassigns ttys, so retrying only keeps the run going to MaxRuntime).
 //     Whatever is left then waits for the next run. UnknownStreak grows at most once per run per tab.
 //   - Restoring everything at once has hit pool_saturated, so send Batch tabs at a time, BatchInterval apart.
 //   - Kinds of failure are not told apart. A tab that has not come back after MaxAttempts sends is not sent
@@ -215,13 +219,13 @@ func Restore(env *Env, opt Options) error {
 			return true, false
 		}
 		// Re-read the tree right before sending: a tty from the first read can be stale
-		fresh, reason, unverifiable := env.recheckTab(t)
+		fresh, reason, unverifiable, retryable := env.recheckTab(t)
 		if reason != "" {
 			env.Logf("skip %s %s", t.Ref, reason)
 			if unverifiable {
 				bumpStreak(t.UUID)
 			}
-			return true, false
+			return retryable, false
 		}
 		if fg := foregroundOnTty(env.Run, fresh.TTY, t.UUID); fg != FgShell {
 			env.Logf("skip %s cannot confirm only a shell is in the foreground (%s)", t.Ref, fg)
